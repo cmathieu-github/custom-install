@@ -1,0 +1,92 @@
+{
+  "_comment": "Fichier de paramètres par défaut. Modifiez ce fichier pour préconfigurer l'application.",
+  "_comment2": "Les valeurs ici sont des DÉFAUTS. Si l'utilisateur change quelque chose via Paramètres, ça prend la priorité.",
+  "_comment3": "Pour réinitialiser les préférences utilisateur, supprimez : %USERPROFILE%\\.custominstall_config.json",
+
+  "_section_general": "--- Dossier source commun (racine contenant tous les packs) ---",
+  "source_root": "",
+
+  "_section_nds": "--- Packs NDS : 32 Go (pour pack CIA 32 Go uniquement) et 64 Go+ (pour 64/128/256 Go) ---",
+  "nds_packs": {
+    "32 Go": {
+      "folder": "00_Pack_NDS_32Go",
+      "base_folder": "Base NDS",
+      "languages": {
+        "FR": "Jeux NDS",
+        "EN": "Games NDS",
+        "DE": "Spiele NDS",
+        "IT": "Giochi NDS",
+        "SP": "Juegos NDS",
+        "NL": "Spellen NDS"
+      }
+    },
+    "64 Go+": {
+      "folder": "00_Pack_NDS_64Go",
+      "base_folder": "Base NDS",
+      "languages": {
+        "FR": "Jeux NDS",
+        "EN": "Games NDS",
+        "DE": "Spiele NDS",
+        "IT": "Giochi NDS",
+        "SP": "Juegos NDS",
+        "NL": "Spellen NDS"
+      }
+    }
+  },
+
+  "_section_cia_to_nds": "--- Quel pack NDS utiliser selon la taille du pack CIA sélectionné ---",
+  "cia_to_nds": {
+    "32 Go":  "32 Go",
+    "64 Go":  "64 Go+",
+    "128 Go": "64 Go+",
+    "256 Go": "64 Go+"
+  },
+
+  "_section_cia": "--- Packs CIA : ordre d'affichage, dossier du pack et sous-dossiers (relatifs à source_root) ---",
+  "cia_pack_order": ["32 Go", "64 Go", "128 Go", "256 Go"],
+  "cia_packs": {
+    "32 Go": {
+      "folder": "00_Pack_3DS_32Go",
+      "Base": "00_Pack_3DS_32Go_Base",
+      "FR":   "00.1_Pack_3DS_32Go_FR",
+      "EN":   "00.2_Pack_3DS_32Go_EN",
+      "IT":   "00.3_Pack_3DS_32Go_IT",
+      "SP":   "00.4_Pack_3DS_32Go_SP",
+      "DE":   "00.5_Pack_3DS_32Go_DE",
+      "NL":   "00.6_Pack_3DS_32Go_NL"
+    },
+    "64 Go": {
+      "folder": "01_Pack_3DS_64Go",
+      "Base": "01_Pack_3DS_64Go_Base",
+      "FR":   "01.1_Pack_3DS_64Go_FR",
+      "EN":   "01.2_Pack_3DS_64Go_EN",
+      "IT":   "01.3_Pack_3DS_64Go_IT",
+      "SP":   "01.4_Pack_3DS_64Go_SP",
+      "DE":   "01.5_Pack_3DS_64Go_DE",
+      "NL":   "01.6_Pack_3DS_64Go_NL"
+    },
+    "128 Go": {
+      "folder": "02_Pack_3DS_128Go",
+      "Base": "02_Pack_3DS_128Go_Base",
+      "FR":   "02.1_Pack_3DS_128Go_FR",
+      "EN":   "02.2_Pack_3DS_128Go_EN",
+      "IT":   "02.3_Pack_3DS_128Go_IT",
+      "SP":   "02.4_Pack_3DS_128Go_SP",
+      "DE":   "02.5_Pack_3DS_128Go_DE",
+      "NL":   "02.6_Pack_3DS_128Go_NL"
+    },
+    "256 Go": {
+      "folder": "03_Pack_3DS_256Go",
+      "Base": "03_Pack_3DS_256Go_Base",
+      "FR":   "03.1_Pack_3DS_256Go_FR",
+      "EN":   "03.2_Pack_3DS_256Go_EN",
+      "IT":   "03.3_Pack_3DS_256Go_IT",
+      "SP":   "03.4_Pack_3DS_256Go_SP",
+      "DE":   "03.5_Pack_3DS_256Go_DE",
+      "NL":   "03.6_Pack_3DS_256Go_NL"
+    }
+  },
+
+  "_section_custom": "--- Packs customs (onglet Packs Customs) : chemins sources pré-remplis ---",
+  "custom_packs": ["", "", "", "", ""]
+}

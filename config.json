@@ -1,0 +1,115 @@
+{
+  "source_root": "D:\\Desktop\\C&C - Hack\\Pack Jeux 3DS CnC",
+  "nds_source_root": "",
+  "nds_pack_order": [
+    "32 Go",
+    "64 Go+"
+  ],
+  "nds_packs": {
+    "32 Go": {
+      "folder": "00_Pack_NDS_For_3DS_32Go",
+      "base_folder": "Base NDS",
+      "languages": {
+        "FR": "Jeux NDS",
+        "EN": "Games NDS",
+        "DE": "Spiele NDS",
+        "IT": "Giochi NDS",
+        "SP": "Juegos NDS",
+        "NL": "Spellen NDS"
+      }
+    },
+    "64 Go+": {
+      "folder": "00_Pack_NDS_For_3DS_64Go",
+      "base_folder": "Base NDS",
+      "languages": {
+        "FR": "Jeux NDS",
+        "EN": "Games NDS",
+        "DE": "Spiele NDS",
+        "IT": "Giochi NDS",
+        "SP": "Juegos NDS",
+        "NL": "Spellen NDS"
+      }
+    }
+  },
+  "cia_to_nds": {
+    "32 Go": "32 Go",
+    "64 Go": "64 Go+",
+    "128 Go": "64 Go+",
+    "256 Go": "64 Go+"
+  },
+  "cia_pack_order": [
+    "32 Go",
+    "64 Go",
+    "128 Go",
+    "256 Go"
+  ],
+  "cia_packs": {
+    "32 Go": {
+      "folder": "01_Pack_3DS_32Go",
+      "Base": "01_Pack_3DS_32Go_Base",
+      "FR": "01_Pack_3DS_32Go_FR",
+      "EN": "01_Pack_3DS_32Go_EN",
+      "IT": "01_Pack_3DS_32Go_IT",
+      "SP": "01_Pack_3DS_32Go_SP",
+      "DE": "01_Pack_3DS_32Go_DE",
+      "NL": "01_Pack_3DS_32Go_NL"
+    },
+    "64 Go": {
+      "folder": "02_Pack_3DS_64Go",
+      "Base": "02_Pack_3DS_64Go_Base",
+      "FR": "02_Pack_3DS_64Go_FR",
+      "EN": "02_Pack_3DS_64Go_EN",
+      "IT": "02_Pack_3DS_64Go_IT",
+      "SP": "02_Pack_3DS_64Go_SP",
+      "DE": "02_Pack_3DS_64Go_DE",
+      "NL": "02_Pack_3DS_64Go_NL"
+    },
+    "128 Go": {
+      "folder": "03_Pack_3DS_128Go",
+      "Base": "03_Pack_3DS_128Go_Base",
+      "FR": "03_Pack_3DS_128Go_FR",
+      "EN": "03_Pack_3DS_128Go_EN",
+      "IT": "03_Pack_3DS_128Go_IT",
+      "SP": "03_Pack_3DS_128Go_SP",
+      "DE": "03_Pack_3DS_128Go_DE",
+      "NL": "03_Pack_3DS_128Go_NL"
+    },
+    "256 Go": {
+      "folder": "04_Pack_3DS_256Go",
+      "Base": "04_Pack_3DS_256Go_Base",
+      "FR": "",
+      "EN": "",
+      "IT": "",
+      "SP": "",
+      "DE": "",
+      "NL": ""
+    }
+  },
+  "custom_packs": [
+    {
+      "path": "",
+      "enabled": false,
+      "name": ""
+    },
+    {
+      "path": "",
+      "enabled": false,
+      "name": ""
+    },
+    {
+      "path": "D:/Desktop/C&C - Hack/3DS/A - Hack Famille 3DS v3.1/1 - Hack NTRBoot/2 - Luma sans Wifi",
+      "enabled": true,
+      "name": ""
+    },
+    {
+      "path": "D:/Desktop/C&C - Hack/3DS/A - Hack Famille 3DS v3.1/1 - Hack NTRBoot/1 - Copy to SD 1 - Boot9Strap",
+      "enabled": true,
+      "name": ""
+    },
+    {
+      "path": "",
+      "enabled": false,
+      "name": ""
+    }
+  ]
+}

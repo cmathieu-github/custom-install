@@ -6,8 +6,11 @@
 # This file is licensed under The MIT License (MIT).
 # You can find the full license text in LICENSE.md in the root of this project.
 
-from os import environ, scandir
-from os.path import abspath, basename, dirname, join, isfile
+import string
+import shutil
+import time
+from os import environ, makedirs, scandir, walk
+from os.path import abspath, basename, dirname, getsize, isdir, join, isfile, relpath
 import sys
 from threading import Thread, Lock
 from time import strftime
@@ -27,6 +30,8 @@ from pyctr.type.tmd import TitleMetadataError
 
 from . import __version__
 from .__main__ import CustomInstall, load_cifinish, InvalidCIFinishError, InstallStatus, save3ds_fuse_path
+from .config import load_config, save_config, load_profiles, save_profiles
+from .ndscopy import NDSCopier
 
 if TYPE_CHECKING:
     from os import PathLike
@@ -92,6 +97,95 @@ statuses = {
     InstallStatus.Done: 'Done',
     InstallStatus.Failed: 'Failed',
 }
+
+
+def get_windows_drives():
+    if not is_windows:
+        return []
+    import ctypes as ct
+    drives = []
+    bitmask = ct.windll.kernel32.GetLogicalDrives()
+    for letter in string.ascii_uppercase:
+        if bitmask & 1:
+            drives.append(letter + ':')
+        bitmask >>= 1
+    return drives
+
+
+def get_windows_drives_info():
+    """Return drive list with volume name and size, e.g. ['E: — SanDisk (32 Go)', ...]."""
+    if not is_windows:
+        return []
+    import ctypes as ct
+    import ctypes.wintypes as wt
+    result = []
+    bitmask = ct.windll.kernel32.GetLogicalDrives()
+    for letter in string.ascii_uppercase:
+        if not (bitmask & 1):
+            bitmask >>= 1
+            continue
+        bitmask >>= 1
+        drive = letter + ':\\'
+        vol_name = ct.create_unicode_buffer(261)
+        try:
+            ct.windll.kernel32.GetVolumeInformationW(
+                drive, vol_name, 261, None, None, None, None, 0)
+        except Exception:
+            vol_name.value = ''
+        total = ct.c_ulonglong(0)
+        try:
+            ct.windll.kernel32.GetDiskFreeSpaceExW(drive, None, ct.byref(total), None)
+        except Exception:
+            pass
+        gb = total.value / (1024 ** 3)
+        if gb >= 1:
+            size_str = f'{gb:.0f} Go'
+        elif total.value > 0:
+            size_str = f'{total.value / (1024 ** 2):.0f} Mo'
+        else:
+            size_str = None
+        name = vol_name.value.strip()
+        if name and size_str:
+            label = f'{letter}: — {name} ({size_str})'
+        elif name:
+            label = f'{letter}: — {name}'
+        elif size_str:
+            label = f'{letter}: ({size_str})'
+        else:
+            label = f'{letter}:'
+        result.append(label)
+    return result
+
+
+_DRIVE_NONE = '(Aucun)'
+
+
+def _drive_combo_values():
+    """Returns [_DRIVE_NONE] + current drives list."""
+    return [_DRIVE_NONE] + get_windows_drives_info()
+
+
+def _drive_to_path(value):
+    """Convert a drive combo value like 'E: — SanDisk (32 Go)' or 'E:' to 'E:\\'."""
+    value = (value or '').strip()
+    if not value or value == _DRIVE_NONE:
+        return ''
+    if is_windows and len(value) >= 2 and value[1] == ':':
+        rest = value[2:]
+        if not rest or rest[0] in (' ', '—', '—'):
+            return value[0].upper() + ':\\'
+    return value
+
+
+def _try_get_id0(movable_path):
+    """Extraire l'ID0 depuis un fichier movable.sed (via CryptoEngine).
+    Retourne la chaîne hex de l'ID0, ou None en cas d'échec."""
+    try:
+        crypto = CryptoEngine()
+        crypto.setup_sd_key_from_file(movable_path)
+        return crypto.id0.hex()
+    except Exception:
+        return None
 
 
 class ConsoleFrame(ttk.Frame):
@@ -270,41 +364,37 @@ class CustomInstallGUI(ttk.Frame):
     console = None
     b9_loaded = False
 
-    def __init__(self, parent: tk.Tk = None):
+    def __init__(self, parent: tk.Tk = None, config: dict = None):
         super().__init__(parent)
         self.parent = parent
+        self.config = config or {}
 
-        # readers to give to CustomInstall at the install
         self.readers = {}
-
         self.lock = Lock()
-
         self.log_messages = []
+        self.hwnd = None
 
-        self.hwnd = None  # will be set later
-
-        self.rowconfigure(2, weight=1)
+        self.rowconfigure(1, weight=1)
         self.columnconfigure(0, weight=1)
 
         if taskbar:
-            # this is so progress can be shown in the taskbar
             def setup_tab():
-                self.hwnd = int(parent.wm_frame(), 16)
+                self.hwnd = int(self.winfo_toplevel().wm_frame(), 16)
                 taskbar.ActivateTab(self.hwnd)
-
             self.after(100, setup_tab)
 
         # ---------------------------------------------------------------- #
-        # create file pickers for base files
-        file_pickers = ttk.Frame(self)
-        file_pickers.grid(row=0, column=0, sticky=tk.EW)
-        file_pickers.columnconfigure(1, weight=1)
+        # Destination et fichiers requis
+        dest_frame = ttk.LabelFrame(self, text='Destination et fichiers requis')
+        dest_frame.grid(row=0, column=0, sticky=tk.EW, padx=10, pady=(10, 5))
+        dest_frame.columnconfigure(1, weight=1)
 
         self.file_picker_textboxes = {}
 
         def sd_callback():
-            f = fd.askdirectory(parent=parent, title='Select SD root (the directory or drive that contains '
-                                                     '"Nintendo 3DS")', initialdir=file_parent, mustexist=True)
+            f = fd.askdirectory(parent=parent,
+                                title='Sélectionner la racine SD (le dossier ou lecteur contenant "Nintendo 3DS")',
+                                initialdir=file_parent, mustexist=True)
             if f:
                 cifinish_path = join(f, 'cifinish.bin')
                 try:
@@ -327,16 +417,52 @@ class CustomInstallGUI(ttk.Frame):
                     if filename == 'seeddb.bin':
                         load_seeddb(path)
 
+        ttk.Label(dest_frame, text='Racine SD :').grid(row=0, column=0, sticky=tk.W, padx=(10, 5), pady=(8, 3))
 
-        sd_type_label = ttk.Label(file_pickers, text='SD root')
-        sd_type_label.grid(row=0, column=0)
+        sd_inner = ttk.Frame(dest_frame)
+        sd_inner.grid(row=0, column=1, sticky=tk.EW, padx=5, pady=(8, 3))
+        sd_inner.columnconfigure(2, weight=1)
 
-        sd_selected = tk.Text(file_pickers, wrap='none', height=1)
-        sd_selected.grid(row=0, column=1, sticky=tk.EW)
+        drives_info = _drive_combo_values()
+        self._sd_drive_combo = ttk.Combobox(sd_inner, values=drives_info, state='readonly', width=22)
+        self._sd_drive_combo.current(0)  # (Aucun) par défaut
+        self._sd_drive_combo.grid(row=0, column=0, padx=(0, 3))
 
-        sd_button = ttk.Button(file_pickers, text='...', command=sd_callback)
-        sd_button.grid(row=0, column=2)
+        def refresh_sd_drives():
+            info = _drive_combo_values()
+            cur = self._sd_drive_combo.get()
+            self._sd_drive_combo.configure(values=info)
+            if cur in info:
+                self._sd_drive_combo.current(info.index(cur))
 
+        ttk.Button(sd_inner, text='↻', width=3, command=refresh_sd_drives).grid(row=0, column=1, padx=(0, 6))
+
+        sd_selected = tk.Text(sd_inner, wrap='none', height=1)
+        sd_selected.grid(row=0, column=2, sticky=tk.EW)
+
+        def on_sd_drive_selected(event):
+            path = _drive_to_path(self._sd_drive_combo.get())
+            sd_selected.delete('1.0', tk.END)
+            sd_selected.insert(tk.END, path)
+            for filename in ['boot9.bin', 'seeddb.bin', 'movable.sed']:
+                p = auto_input_filename(self, path, filename)
+                if filename == 'boot9.bin':
+                    self.check_b9_loaded()
+                    self.enable_buttons()
+                if filename == 'seeddb.bin' and p:
+                    load_seeddb(p)
+
+        self._sd_drive_combo.bind('<<ComboboxSelected>>', on_sd_drive_selected)
+
+        ttk.Button(dest_frame, text='...', command=sd_callback).grid(row=0, column=2, padx=(0, 3), pady=(8, 3))
+
+        def clear_sd():
+            sd_selected.delete('1.0', tk.END)
+            drives = _drive_combo_values()
+            self._sd_drive_combo.configure(values=drives)
+            self._sd_drive_combo.current(0)  # retour sur (Aucun)
+
+        ttk.Button(dest_frame, text='×', width=2, command=clear_sd).grid(row=0, column=3, padx=(0, 10), pady=(8, 3))
         self.file_picker_textboxes['sd'] = sd_selected
 
         def auto_input_filename(self, f, filename):
@@ -344,87 +470,100 @@ class CustomInstallGUI(ttk.Frame):
                 [join(f, "gm9", "out", filename), join(f, "boot9strap", filename), join(f, filename)]
             )
             if sd_msed_path:
-                self.log('Found ' + filename + ' on SD card at ' + sd_msed_path)
+                self.log('Trouvé ' + filename + ' sur la SD : ' + sd_msed_path)
                 if filename.endswith('bin'):
                     filename = filename.split('.')[0]
                 box = self.file_picker_textboxes[filename]
                 box.delete('1.0', tk.END)
                 box.insert(tk.END, sd_msed_path)
+                if filename == 'movable.sed':
+                    self._update_id0(sd_msed_path)
                 return sd_msed_path
-        # This feels so wrong.
+
         def create_required_file_picker(type_name, types, default, row, callback=lambda filename: None):
             def internal_callback():
-                f = fd.askopenfilename(parent=parent, title='Select ' + type_name, filetypes=types,
-                                       initialdir=file_parent)
+                f = fd.askopenfilename(parent=parent, title='Sélectionner ' + type_name,
+                                       filetypes=types, initialdir=file_parent)
                 if f:
                     selected.delete('1.0', tk.END)
                     selected.insert(tk.END, f)
                     callback(f)
 
-            type_label = ttk.Label(file_pickers, text=type_name)
-            type_label.grid(row=row, column=0)
-
-            selected = tk.Text(file_pickers, wrap='none', height=1)
-            selected.grid(row=row, column=1, sticky=tk.EW)
+            ttk.Label(dest_frame, text=type_name + ' :').grid(row=row, column=0, sticky=tk.W, padx=(10, 5), pady=3)
+            selected = tk.Text(dest_frame, wrap='none', height=1)
+            selected.grid(row=row, column=1, sticky=tk.EW, padx=5, pady=3)
             if default:
                 selected.insert(tk.END, default)
-
-            button = ttk.Button(file_pickers, text='...', command=internal_callback)
-            button.grid(row=row, column=2)
-
+            ttk.Button(dest_frame, text='...', command=internal_callback).grid(row=row, column=2, padx=(0, 3), pady=3)
+            ttk.Button(dest_frame, text='×', width=2,
+                       command=lambda s=selected: s.delete('1.0', tk.END)).grid(row=row, column=3, padx=(0, 10), pady=3)
             self.file_picker_textboxes[type_name] = selected
 
-        def b9_callback(path: 'Union[PathLike, bytes, str]'):
+        def b9_callback(path):
             self.check_b9_loaded()
             self.enable_buttons()
 
-        def seeddb_callback(path: 'Union[PathLike, bytes, str]'):
+        def seeddb_callback(path):
             load_seeddb(path)
 
         create_required_file_picker('boot9', [('boot9 file', '*.bin')], default_b9_path, 1, b9_callback)
         create_required_file_picker('seeddb', [('seeddb file', '*.bin')], default_seeddb_path, 2, seeddb_callback)
-        create_required_file_picker('movable.sed', [('movable.sed file', '*.sed')], default_movable_sed_path, 3)
+        def movable_callback(path):
+            self._update_id0(path)
+        create_required_file_picker('movable.sed', [('movable.sed file', '*.sed')], default_movable_sed_path, 3,
+                                    movable_callback)
+
+        # ID0 détecté depuis movable.sed
+        ttk.Label(dest_frame, text='ID0 :').grid(row=4, column=0, sticky=tk.W, padx=(10, 5), pady=3)
+        self._id0_label = ttk.Label(dest_frame, text='(sélectionner movable.sed)', foreground='grey')
+        self._id0_label.grid(row=4, column=1, sticky=tk.W, padx=5, pady=3)
+
+        if default_movable_sed_path:
+            self._update_id0(default_movable_sed_path)
 
         # ---------------------------------------------------------------- #
-        # create buttons to add cias
-        titlelist_buttons = ttk.Frame(self)
-        titlelist_buttons.grid(row=1, column=0)
+        # Fichiers CIA à installer
+        cia_frame = ttk.LabelFrame(self, text='Fichiers CIA à installer')
+        cia_frame.grid(row=1, column=0, sticky=tk.NSEW, padx=10, pady=5)
+        cia_frame.rowconfigure(2, weight=1)
+        cia_frame.columnconfigure(0, weight=1)
+
+        btn_row = ttk.Frame(cia_frame)
+        btn_row.grid(row=0, column=0, sticky=tk.EW, padx=5, pady=(5, 2))
 
         def add_cias_callback():
-            files = fd.askopenfilenames(parent=parent, title='Select CIA files', filetypes=[('CIA files', '*.cia')],
-                                        initialdir=file_parent)
+            files = fd.askopenfilenames(parent=parent, title='Sélectionner des fichiers CIA',
+                                        filetypes=[('CIA files', '*.cia')], initialdir=file_parent)
             results = {}
             for f in files:
                 success, reason = self.add_cia(f)
                 if not success:
                     results[f] = reason
-
             if results:
-                title_read_fail_window = TitleReadFailResults(self.parent, failed=results)
-                title_read_fail_window.focus()
+                TitleReadFailResults(self.parent, failed=results).focus()
             self.sort_treeview()
 
-        add_cias = ttk.Button(titlelist_buttons, text='Add CIAs', command=add_cias_callback)
-        add_cias.grid(row=0, column=0)
+        add_cias = ttk.Button(btn_row, text='Ajouter CIA', command=add_cias_callback)
+        add_cias.grid(row=0, column=0, padx=(0, 3))
 
         def add_cdn_callback():
-            d = fd.askdirectory(parent=parent, title='Select folder containing title contents in CDN format',
-                                initialdir=file_parent)
+            d = fd.askdirectory(parent=parent, title='Sélectionner un dossier CDN', initialdir=file_parent)
             if d:
                 if isfile(join(d, 'tmd')):
                     success, reason = self.add_cia(d)
                     if not success:
-                        self.show_error(f"Couldn't add {basename(d)}: {reason}")
+                        self.show_error(f"Impossible d'ajouter {basename(d)} : {reason}")
                     else:
                         self.sort_treeview()
                 else:
-                    self.show_error('tmd file not found in the CDN directory:\n' + d)
+                    self.show_error('Fichier tmd introuvable dans le dossier CDN :\n' + d)
 
-        add_cdn = ttk.Button(titlelist_buttons, text='Add CDN title folder', command=add_cdn_callback)
-        add_cdn.grid(row=0, column=1)
+        add_cdn = ttk.Button(btn_row, text='Ajouter CDN', command=add_cdn_callback)
+        add_cdn.grid(row=0, column=1, padx=3)
 
         def add_dirs_callback():
-            d = fd.askdirectory(parent=parent, title='Select folder containing CIA files', initialdir=file_parent)
+            d = fd.askdirectory(parent=parent, title='Sélectionner un dossier contenant des CIA',
+                                initialdir=file_parent)
             if d:
                 results = {}
                 for f in scandir(d):
@@ -432,26 +571,42 @@ class CustomInstallGUI(ttk.Frame):
                         success, reason = self.add_cia(f.path)
                         if not success:
                             results[f] = reason
-
                 if results:
-                    title_read_fail_window = TitleReadFailResults(self.parent, failed=results)
-                    title_read_fail_window.focus()
+                    TitleReadFailResults(self.parent, failed=results).focus()
                 self.sort_treeview()
 
-        add_dirs = ttk.Button(titlelist_buttons, text='Add folder', command=add_dirs_callback)
-        add_dirs.grid(row=0, column=2)
+        add_dirs = ttk.Button(btn_row, text='Ajouter dossier', command=add_dirs_callback)
+        add_dirs.grid(row=0, column=2, padx=3)
 
         def remove_selected_callback():
             for entry in self.treeview.selection():
                 self.remove_cia(entry)
 
-        remove_selected = ttk.Button(titlelist_buttons, text='Remove selected', command=remove_selected_callback)
-        remove_selected.grid(row=0, column=3)
+        remove_selected = ttk.Button(btn_row, text='Supprimer sélection', command=remove_selected_callback)
+        remove_selected.grid(row=0, column=3, padx=3)
 
-        # ---------------------------------------------------------------- #
-        # create treeview
-        treeview_frame = ttk.Frame(self)
-        treeview_frame.grid(row=2, column=0, sticky=tk.NSEW)
+        # Chargement depuis un pack
+        pack_frame = ttk.LabelFrame(cia_frame, text='Charger depuis un pack')
+        pack_frame.grid(row=1, column=0, sticky=tk.EW, padx=5, pady=2)
+
+        ttk.Label(pack_frame, text='Taille :').grid(row=0, column=0, padx=(8, 2), pady=4)
+        pack_sizes = self.config.get('cia_pack_order', ['32 Go', '64 Go', '128 Go', '256 Go'])
+        self._pack_size_var = tk.StringVar(value=pack_sizes[1] if len(pack_sizes) > 1 else (pack_sizes[0] if pack_sizes else ''))
+        ttk.Combobox(pack_frame, textvariable=self._pack_size_var, values=pack_sizes,
+                     state='readonly', width=8).grid(row=0, column=1, padx=2)
+
+        ttk.Label(pack_frame, text='Langue :').grid(row=0, column=2, padx=(12, 2))
+        first_pack = next(iter(self.config.get('cia_packs', {}).values()), {})
+        cia_langs = [k for k in first_pack if k != 'Base']
+        self._pack_lang_var = tk.StringVar(value=cia_langs[0] if cia_langs else '')
+        ttk.Combobox(pack_frame, textvariable=self._pack_lang_var, values=cia_langs,
+                     state='readonly', width=6).grid(row=0, column=3, padx=2)
+
+        ttk.Button(pack_frame, text='Charger', command=self._load_pack).grid(row=0, column=4, padx=(12, 8))
+
+        # Treeview
+        treeview_frame = ttk.Frame(cia_frame)
+        treeview_frame.grid(row=2, column=0, sticky=tk.NSEW, padx=5, pady=(2, 5))
         treeview_frame.rowconfigure(0, weight=1)
         treeview_frame.columnconfigure(0, weight=1)
 
@@ -463,54 +618,75 @@ class CustomInstallGUI(ttk.Frame):
         self.treeview.configure(columns=('filepath', 'titleid', 'titlename', 'status'), show='headings')
 
         self.treeview.column('filepath', width=200, anchor=tk.W)
-        self.treeview.heading('filepath', text='File path')
+        self.treeview.heading('filepath', text='Fichier')
         self.treeview.column('titleid', width=70, anchor=tk.W)
-        self.treeview.heading('titleid', text='Title ID')
+        self.treeview.heading('titleid', text='ID Titre')
         self.treeview.column('titlename', width=150, anchor=tk.W)
-        self.treeview.heading('titlename', text='Title name')
+        self.treeview.heading('titlename', text='Nom')
         self.treeview.column('status', width=20, anchor=tk.W)
-        self.treeview.heading('status', text='Status')
+        self.treeview.heading('status', text='Statut')
 
         treeview_scrollbar.configure(command=self.treeview.yview)
 
         # ---------------------------------------------------------------- #
-        # create progressbar
-
+        # Progression
         self.progressbar = ttk.Progressbar(self, orient=tk.HORIZONTAL, mode='determinate')
-        self.progressbar.grid(row=3, column=0, sticky=tk.NSEW)
+        self.progressbar.grid(row=2, column=0, sticky=tk.EW, padx=10, pady=2)
 
         # ---------------------------------------------------------------- #
-        # create start and console buttons
-
-        control_frame = ttk.Frame(self)
-        control_frame.grid(row=4, column=0)
+        # Options
+        opts_frame = ttk.LabelFrame(self, text='Options')
+        opts_frame.grid(row=3, column=0, sticky=tk.EW, padx=10, pady=5)
 
         self.skip_contents_var = tk.IntVar()
-        skip_contents_checkbox = ttk.Checkbutton(control_frame, text='Skip contents (only add to title database)',
-                                                 variable=self.skip_contents_var)
-        skip_contents_checkbox.grid(row=0, column=0)
+        ttk.Checkbutton(opts_frame, text='Sans contenu (base de données uniquement)',
+                        variable=self.skip_contents_var).grid(row=0, column=0, sticky=tk.W, padx=5, pady=(5, 2))
 
         self.overwrite_saves_var = tk.IntVar()
-        overwrite_saves_checkbox = ttk.Checkbutton(control_frame, text='Overwrite existing saves',
-                                                   variable=self.overwrite_saves_var)
-        overwrite_saves_checkbox.grid(row=0, column=1)
+        ttk.Checkbutton(opts_frame, text='Écraser les sauvegardes existantes',
+                        variable=self.overwrite_saves_var).grid(row=0, column=1, sticky=tk.W, padx=5, pady=(5, 2))
 
-        show_console = ttk.Button(control_frame, text='Show console', command=self.open_console)
-        show_console.grid(row=0, column=2)
+        nds_sub = ttk.Frame(opts_frame)
+        nds_sub.grid(row=1, column=0, columnspan=2, sticky=tk.EW, padx=5, pady=(0, 5))
 
-        start = ttk.Button(control_frame, text='Start install', command=self.start_install)
-        start.grid(row=0, column=3)
+        self._nds_enabled_var = tk.IntVar()
+        ttk.Checkbutton(nds_sub, text='Copier aussi les jeux NDS',
+                        variable=self._nds_enabled_var,
+                        command=self._toggle_nds).grid(row=0, column=0, padx=(0, 8))
 
-        self.status_label = ttk.Label(self, text='Waiting...')
-        self.status_label.grid(row=5, column=0, sticky=tk.NSEW)
+        self._nds_auto_label = ttk.Label(nds_sub, text='', foreground='grey')
+        self._nds_auto_label.grid(row=0, column=1, padx=(0, 8))
+
+        ttk.Label(nds_sub, text='Langue :').grid(row=0, column=2, padx=(0, 4))
+        first_nds = next(iter(self.config.get('nds_packs', {}).values()), {})
+        nds_langs = list(first_nds.get('languages', {}).keys())
+        self._nds_lang_var = tk.StringVar(value=nds_langs[0] if nds_langs else '')
+        self._nds_lang_combo = ttk.Combobox(nds_sub, textvariable=self._nds_lang_var,
+                                             values=nds_langs, state=tk.DISABLED, width=12)
+        self._nds_lang_combo.grid(row=0, column=3)
+
+        # ---------------------------------------------------------------- #
+        # Statut et boutons
+        bottom_frame = ttk.Frame(self)
+        bottom_frame.grid(row=4, column=0, sticky=tk.EW, padx=10, pady=(0, 10))
+        bottom_frame.columnconfigure(0, weight=1)
+
+        self.status_label = ttk.Label(bottom_frame, text='En attente...')
+        self.status_label.grid(row=0, column=0, sticky=tk.W)
+
+        show_console = ttk.Button(bottom_frame, text='Console', command=self.open_console)
+        show_console.grid(row=0, column=1, padx=5)
+
+        start = ttk.Button(bottom_frame, text='Installer', command=self.start_install)
+        start.grid(row=0, column=2)
 
         self.log(f'custom-install {__version__} - https://github.com/ihaveamac/custom-install', status=False)
 
         if is_windows and not taskbar:
-            self.log('Note: Could not load taskbar lib.')
-            self.log('Note: Progress will not be shown in the Windows taskbar.')
+            self.log('Note: bibliothèque taskbar introuvable.')
+            self.log('Note: la progression ne sera pas visible dans la barre des tâches Windows.')
 
-        self.log('Ready.')
+        self.log('Prêt.')
 
         self.require_boot9 = (add_cias, add_cdn, add_dirs, remove_selected, start)
 
@@ -518,7 +694,10 @@ class CustomInstallGUI(ttk.Frame):
         self.check_b9_loaded()
         self.enable_buttons()
         if not self.b9_loaded:
-            self.log('Note: boot9 was not auto-detected. Please choose it before adding any titles.')
+            self.log("Note: boot9 non détecté automatiquement. Veuillez le sélectionner avant d'ajouter des titres.")
+
+        self._pack_size_var.trace_add('write', lambda *_: self._update_nds_label())
+        self._update_nds_label()
 
     def sort_treeview(self):
         l = [(self.treeview.set(k, 'titlename'), k) for k in self.treeview.get_children()]
@@ -629,6 +808,189 @@ class CustomInstallGUI(ttk.Frame):
         for b in self.file_picker_textboxes.values():
             b.config(state=tk.NORMAL)
 
+    def _load_pack(self):
+        source_root = self.config.get('source_root', '').strip()
+        if not source_root:
+            self.show_error("Le dossier source commun n'est pas configuré.\n"
+                            "Allez dans l'onglet Paramètres > Général.")
+            return
+
+        size = self._pack_size_var.get()
+        language = self._pack_lang_var.get()
+        pack_order = self.config.get('cia_pack_order', [])
+        cia_packs = self.config.get('cia_packs', {})
+
+        if size not in pack_order:
+            self.show_error(f'Taille de pack inconnue : {size}')
+            return
+
+        sizes_to_include = pack_order[:pack_order.index(size) + 1]
+
+        folders = []
+        for s in sizes_to_include:
+            variants = cia_packs.get(s, {})
+            pack_folder = variants.get('folder', '').strip()
+            for key in ('Base', language):
+                subfolder = variants.get(key, '').strip()
+                if subfolder:
+                    if pack_folder:
+                        folders.append(join(source_root, pack_folder, subfolder))
+                    else:
+                        # Compatibilité ancien format (chemin complet dans chaque variante)
+                        folders.append(join(source_root, subfolder))
+
+        added = 0
+        failed = {}
+        for folder in folders:
+            if not isdir(folder):
+                self.log(f'Dossier introuvable (ignoré) : {folder}')
+                continue
+            for entry in scandir(folder):
+                if entry.name.lower().endswith('.cia') and entry.is_file():
+                    success, reason = self.add_cia(entry.path)
+                    if success:
+                        added += 1
+                    elif reason != 'File already in list':
+                        failed[entry.path] = reason
+
+        self.sort_treeview()
+        self.log(f'Pack {size} ({language}) chargé : {added} CIA ajoutés.')
+        if failed:
+            TitleReadFailResults(self.parent, failed=failed).focus()
+
+    def _toggle_nds(self):
+        state = 'readonly' if self._nds_enabled_var.get() else tk.DISABLED
+        self._nds_lang_combo.config(state=state)
+
+    def _update_id0(self, path):
+        """Lancer l'extraction de l'ID0 depuis movable.sed dans un thread de fond."""
+        if not path or not isfile(path):
+            self._id0_label.config(text='(fichier introuvable)', foreground='red')
+            return
+        self._id0_label.config(text='Lecture...', foreground='grey')
+        def _do():
+            id0 = _try_get_id0(path)
+            def _set():
+                if id0:
+                    self._id0_label.config(text=id0, foreground='#005500')
+                else:
+                    self._id0_label.config(text='(impossible de lire le movable.sed)', foreground='red')
+            self.after(0, _set)
+        Thread(target=_do, daemon=True).start()
+
+    def _update_nds_label(self):
+        cia_size = self._pack_size_var.get()
+        nds_size = self.config.get('cia_to_nds', {}).get(cia_size, '?')
+        self._nds_auto_label.config(text=f'→ Pack NDS : {nds_size}')
+
+    def _run_nds_copy(self, target_path):
+        """Copie les jeux NDS vers target_path (appelé depuis le thread d'installation)."""
+        source_root = (self.config.get('nds_source_root', '').strip()
+                       or self.config.get('source_root', '').strip())
+        if not source_root:
+            self.log('Copie NDS ignorée : dossier source non configuré dans les Paramètres.')
+            return
+
+        cia_size = self._pack_size_var.get()
+        nds_size = self.config.get('cia_to_nds', {}).get(cia_size)
+        if not nds_size:
+            self.log(f'Copie NDS ignorée : pas de mapping NDS pour {cia_size}.')
+            return
+
+        nds_packs = self.config.get('nds_packs', {})
+        nds_pack_order = self.config.get('nds_pack_order', list(nds_packs.keys()))
+        language = self._nds_lang_var.get()
+
+        # Logique additive : tous les packs jusqu'au pack cible inclus
+        try:
+            packs_to_copy = nds_pack_order[:nds_pack_order.index(nds_size) + 1]
+        except ValueError:
+            packs_to_copy = [nds_size]
+
+        # --- Vérification de l'espace disponible ---
+        self.log("Calcul de l'espace NDS requis...")
+        total_nds_size = 0
+        for pack_name in packs_to_copy:
+            nds_pack = nds_packs.get(pack_name)
+            if not nds_pack:
+                continue
+            pack_root = join(source_root, nds_pack.get('folder', '').rstrip('/\\'))
+            base_dir = join(pack_root, nds_pack.get('base_folder', 'Base NDS'))
+            if isdir(base_dir):
+                for dp, _, fns in walk(base_dir):
+                    for fn in fns:
+                        try:
+                            total_nds_size += getsize(join(dp, fn))
+                        except OSError:
+                            pass
+            lang_folder = nds_pack.get('languages', {}).get(language, '')
+            if lang_folder:
+                lang_dir = join(pack_root, lang_folder)
+                if isdir(lang_dir):
+                    for dp, _, fns in walk(lang_dir):
+                        for fn in fns:
+                            try:
+                                total_nds_size += getsize(join(dp, fn))
+                            except OSError:
+                                pass
+        try:
+            free = shutil.disk_usage(target_path).free
+            if total_nds_size > free:
+                needed_gb = total_nds_size / (1024 ** 3)
+                free_gb = free / (1024 ** 3)
+                self.log(f'Copie NDS annulée : {needed_gb:.2f} Go requis, {free_gb:.2f} Go disponibles.')
+                self.after(0, lambda n=needed_gb, f=free_gb: self.show_error(
+                    f'Espace insuffisant pour la copie NDS :\n'
+                    f'Requis : {n:.2f} Go\nDisponible : {f:.2f} Go'))
+                return
+        except OSError:
+            pass  # disque inaccessible : on tente quand même
+
+        # --- Copie ---
+        self.log(f'Copie NDS ({language}) – {" + ".join(packs_to_copy)}...')
+        self.after(0, lambda: self.progressbar.config(maximum=100, value=0))
+        cancelled = [False]
+
+        def on_progress(copied, total, speed, filename):
+            # Appelé depuis le thread de copie → after() obligatoire
+            pct = (copied / total * 100) if total > 0 else 0
+            def _upd(p=pct, s=speed, f=filename):
+                self.progressbar.config(value=p)
+                self.status_label.config(
+                    text=f'NDS {p:.1f}%  —  {s / (1024 ** 2):.1f} Mo/s  —  {f}')
+            self.after(0, _upd)
+
+        def on_error(message):
+            self.log(f'Erreur NDS : {message}')
+            self.after(0, lambda m=message: self.show_error(
+                f'Erreur lors de la copie NDS :\n{m}'))
+
+        for pack_name in packs_to_copy:
+            if cancelled[0]:
+                break
+            nds_pack = nds_packs.get(pack_name)
+            if not nds_pack:
+                self.log(f'Pack NDS "{pack_name}" introuvable, ignoré.')
+                continue
+            if len(packs_to_copy) > 1:
+                self.log(f'▶ Pack NDS {pack_name}...')
+            copier = NDSCopier(
+                source_root=join(source_root, nds_pack.get('folder', '').rstrip('/\\')),
+                base_folder=nds_pack.get('base_folder', 'Base NDS'),
+                language_folders=nds_pack.get('languages', {}),
+            )
+            copier.event.on_log += self.log
+            copier.event.on_progress += on_progress
+            copier.event.on_done += lambda e, s, d, c: (
+                self.log(f'  {int(e)//60}m{int(e)%60:02d}s — {s/(1024**2):.1f} Mo/s')
+                if not c else None
+            )
+            copier.event.on_error += on_error
+            copier.start(language, target_path, cancelled)
+
+        if not cancelled[0]:
+            self.log(f'Jeux NDS copiés → {target_path}')
+
     def start_install(self):
         sd_root = self.file_picker_textboxes['sd'].get('1.0', tk.END).strip()
         seeddb = self.file_picker_textboxes['seeddb'].get('1.0', tk.END).strip()
@@ -726,33 +1088,935 @@ class CustomInstallGUI(ttk.Frame):
         def install():
             try:
                 result, copied_3dsx, application_count = installer.start()
-                if result:
-                    result_window = InstallResults(self.parent,
-                                                   install_state=result,
-                                                   copied_3dsx=copied_3dsx,
-                                                   application_count=application_count)
-                    result_window.focus()
-                elif result is None:
-                    self.show_error("An error occurred when trying to run save3ds_fuse.\n"
-                                    "Either title.db doesn't exist, or save3ds_fuse couldn't be run.")
-                    self.open_console()
+                # Toutes les mises à jour d'interface DOIVENT passer par after() :
+                # créer un Toplevel depuis un thread secondaire crashe Tkinter.
+                def _show_result(r=result, c=copied_3dsx, a=application_count):
+                    if r:
+                        rw = InstallResults(self.parent,
+                                            install_state=r,
+                                            copied_3dsx=c,
+                                            application_count=a)
+                        rw.focus()
+                    elif r is None:
+                        self.show_error("An error occurred when trying to run save3ds_fuse.\n"
+                                        "Either title.db doesn't exist, or save3ds_fuse couldn't be run.")
+                        self.open_console()
+                self.after(0, _show_result)
+                if result and self._nds_enabled_var.get():
+                    self._run_nds_copy(sd_root)
             except:
-                installer.event.on_error(sys.exc_info())
+                exc = sys.exc_info()
+                self.after(0, lambda e=exc: installer.event.on_error(e))
             finally:
-                self.enable_buttons()
+                self.after(0, self.enable_buttons)
 
         Thread(target=install).start()
 
 
+class NDSCopyFrame(ttk.Frame):
+    def __init__(self, parent, config):
+        super().__init__(parent)
+        self.config = config
+        self._cancelled = [False]
+
+        self.rowconfigure(2, weight=1)
+        self.columnconfigure(0, weight=1)
+
+        # --- Destination ---
+        dest_frame = ttk.LabelFrame(self, text='Destination (carte SD)')
+        dest_frame.grid(row=0, column=0, sticky=tk.EW, padx=10, pady=10)
+
+        ttk.Label(dest_frame, text='Lecteur :').grid(row=0, column=0, sticky=tk.W, padx=(8, 4), pady=5)
+
+        # Subframe : combo + ↻ collés ensemble
+        _dc = ttk.Frame(dest_frame)
+        _dc.grid(row=0, column=1, sticky=tk.W, padx=(0, 8), pady=5)
+
+        drives_info = _drive_combo_values()
+        self._drive_combo = ttk.Combobox(_dc, values=drives_info, state='readonly', width=30)
+        self._drive_combo.current(0)  # (Aucun) par défaut
+        self._drive_combo.grid(row=0, column=0, padx=(0, 3))
+
+        def _refresh_nds():
+            cur = self._drive_combo.get()
+            info = _drive_combo_values()
+            self._drive_combo.configure(values=info)
+            self._drive_combo.current(info.index(cur) if cur in info else 0)
+
+        ttk.Button(_dc, text='↻', width=3, command=_refresh_nds).grid(row=0, column=1)
+
+        # --- Options ---
+        opts_frame = ttk.LabelFrame(self, text='Options')
+        opts_frame.grid(row=1, column=0, sticky=tk.EW, padx=10, pady=(0, 10))
+        opts_frame.columnconfigure(1, weight=1)
+
+        ttk.Label(opts_frame, text='Pack NDS :').grid(row=0, column=0, sticky=tk.W, padx=5, pady=5)
+        nds_pack_names = list(config.get('nds_packs', {}).keys())
+        self._nds_pack_var = tk.StringVar(value=nds_pack_names[0] if nds_pack_names else '')
+        self._nds_pack_combo = ttk.Combobox(opts_frame, textvariable=self._nds_pack_var,
+                                             values=nds_pack_names, state='readonly', width=10)
+        self._nds_pack_combo.grid(row=0, column=1, sticky=tk.W, padx=5)
+        self._nds_pack_combo.bind('<<ComboboxSelected>>', self._on_pack_changed)
+
+        ttk.Label(opts_frame, text='Langue :').grid(row=1, column=0, sticky=tk.W, padx=5, pady=5)
+        first_nds = next(iter(config.get('nds_packs', {}).values()), {})
+        langs = list(first_nds.get('languages', {}).keys())
+        self._lang_var = tk.StringVar(value=langs[0] if langs else '')
+        self._lang_combo = ttk.Combobox(opts_frame, textvariable=self._lang_var,
+                                         values=langs, state='readonly', width=15)
+        self._lang_combo.grid(row=1, column=1, sticky=tk.W, padx=5)
+
+        # --- Progression ---
+        prog_frame = ttk.LabelFrame(self, text='Progression')
+        prog_frame.grid(row=2, column=0, sticky=tk.NSEW, padx=10, pady=(0, 10))
+        prog_frame.rowconfigure(3, weight=1)
+        prog_frame.columnconfigure(0, weight=1)
+
+        self._progress_var = tk.DoubleVar()
+        ttk.Progressbar(prog_frame, variable=self._progress_var, maximum=100).grid(
+            row=0, column=0, columnspan=2, sticky=tk.EW, padx=10, pady=(5, 0))
+
+        self._progress_label = ttk.Label(prog_frame, text='En attente...')
+        self._progress_label.grid(row=1, column=0, sticky=tk.W, padx=10)
+
+        self._file_label = ttk.Label(prog_frame, text='', foreground='grey')
+        self._file_label.grid(row=2, column=0, sticky=tk.W, padx=10)
+
+        log_scroll = ttk.Scrollbar(prog_frame, orient=tk.VERTICAL)
+        log_scroll.grid(row=3, column=1, sticky=tk.NSEW)
+        self._log_text = tk.Text(prog_frame, height=8, state=tk.DISABLED,
+                                  wrap='word', yscrollcommand=log_scroll.set)
+        self._log_text.grid(row=3, column=0, sticky=tk.NSEW, padx=(10, 0), pady=5)
+        log_scroll.config(command=self._log_text.yview)
+
+        # --- Boutons ---
+        btn_frame = ttk.Frame(self)
+        btn_frame.grid(row=3, column=0, pady=10)
+
+        self._start_btn = ttk.Button(btn_frame, text='Démarrer la copie', command=self._start)
+        self._start_btn.grid(row=0, column=0, padx=5)
+
+        self._cancel_btn = ttk.Button(btn_frame, text='Annuler', command=self._cancel,
+                                       state=tk.DISABLED)
+        self._cancel_btn.grid(row=0, column=1, padx=5)
+
+        self._last_progress_ts = 0.0  # throttle : max 10 mises à jour/sec
+
+    def _log(self, message):
+        # Peut être appelé depuis n'importe quel thread → planifié sur le thread principal
+        def _do():
+            self._log_text.configure(state=tk.NORMAL)
+            self._log_text.insert(tk.END, message + '\n')
+            self._log_text.see(tk.END)
+            self._log_text.configure(state=tk.DISABLED)
+        self.after(0, _do)
+
+    def _update_progress(self, copied, total, speed, filename):
+        # Appelé depuis le thread NDSCopier → throttle à 10/sec pour ne pas saturer la queue
+        now = time.monotonic()
+        if now - self._last_progress_ts < 0.1:
+            return
+        self._last_progress_ts = now
+        pct = (copied / total * 100) if total > 0 else 0
+        text = (f'{pct:.1f}%  —  {copied / (1024 ** 3):.2f} Go / {total / (1024 ** 3):.2f} Go'
+                f'  —  {speed / (1024 ** 2):.1f} Mo/s')
+        self.after(0, lambda p=pct, t=text, f=filename: (
+            self._progress_var.set(p),
+            self._progress_label.config(text=t),
+            self._file_label.config(text=f),
+        ))
+
+    def _on_error(self, message):
+        def _do():
+            mb.showerror('Erreur', message, parent=self)
+            self._log_text.configure(state=tk.NORMAL)
+            self._log_text.insert(tk.END, f'Erreur : {message}\n')
+            self._log_text.see(tk.END)
+            self._log_text.configure(state=tk.DISABLED)
+            self._start_btn.config(state=tk.NORMAL)
+            self._cancel_btn.config(state=tk.DISABLED)
+        self.after(0, _do)
+
+    def _on_pack_changed(self, event=None):
+        pack_name = self._nds_pack_var.get()
+        nds_pack = self.config.get('nds_packs', {}).get(pack_name, {})
+        langs = list(nds_pack.get('languages', {}).keys())
+        self._lang_combo.configure(values=langs)
+        self._lang_var.set(langs[0] if langs else '')
+
+    def _start(self):
+        dest = self._drive_combo.get().strip()
+        language = self._lang_var.get()
+        source_root = (self.config.get('nds_source_root', '').strip()
+                       or self.config.get('source_root', '').strip())
+        nds_packs = self.config.get('nds_packs', {})
+        nds_pack_order = self.config.get('nds_pack_order', list(nds_packs.keys()))
+        selected_pack = self._nds_pack_var.get()
+
+        target_path = _drive_to_path(dest) if is_windows else dest
+
+        if not target_path:
+            mb.showerror('Erreur', 'Veuillez sélectionner un lecteur de destination.', parent=self)
+            return
+        if not language:
+            mb.showerror('Erreur', 'Veuillez sélectionner une langue.', parent=self)
+            return
+        if not source_root:
+            mb.showerror('Erreur',
+                         "Le dossier source n'est pas configuré.\n"
+                         "Allez dans l'onglet Paramètres.", parent=self)
+            return
+
+        # Logique additive : tous les packs jusqu'au sélectionné inclus
+        try:
+            packs_to_copy = nds_pack_order[:nds_pack_order.index(selected_pack) + 1]
+        except ValueError:
+            packs_to_copy = [selected_pack]
+
+        self._cancelled = [False]
+        self._log_text.configure(state=tk.NORMAL)
+        self._log_text.delete('1.0', tk.END)
+        self._log_text.configure(state=tk.DISABLED)
+        self._progress_var.set(0)
+        self._progress_label.config(text='Démarrage...')
+        self._file_label.config(text='')
+        self._start_btn.config(state=tk.DISABLED)
+        self._cancel_btn.config(state=tk.NORMAL)
+
+        cancelled = self._cancelled
+        config_snap = self.config  # snapshot pour le thread
+
+        def do_copy():
+            # Récapitulatif du mode additif (affiché avant tout pour éviter la confusion)
+            if len(packs_to_copy) > 1:
+                self._log(
+                    f'Mode additif — pack sélectionné : {selected_pack}\n'
+                    f'  Packs copiés (du plus petit au plus grand) : {" → ".join(packs_to_copy)}'
+                )
+            # --- Vérification de l'espace disponible ---
+            self._log("Calcul de l'espace requis...")
+            total_nds_size = 0
+            for pack_name in packs_to_copy:
+                nds_pack = config_snap.get('nds_packs', {}).get(pack_name)
+                if not nds_pack:
+                    continue
+                pack_root = join(source_root, nds_pack.get('folder', '').rstrip('/\\'))
+                base_dir = join(pack_root, nds_pack.get('base_folder', 'Base NDS'))
+                if isdir(base_dir):
+                    for dp, _, fns in walk(base_dir):
+                        for fn in fns:
+                            try:
+                                total_nds_size += getsize(join(dp, fn))
+                            except OSError:
+                                pass
+                lang_folder = nds_pack.get('languages', {}).get(language, '')
+                if lang_folder:
+                    lang_dir = join(pack_root, lang_folder)
+                    if isdir(lang_dir):
+                        for dp, _, fns in walk(lang_dir):
+                            for fn in fns:
+                                try:
+                                    total_nds_size += getsize(join(dp, fn))
+                                except OSError:
+                                    pass
+            try:
+                free = shutil.disk_usage(target_path).free
+                if total_nds_size > free:
+                    needed_gb = total_nds_size / (1024 ** 3)
+                    free_gb = free / (1024 ** 3)
+                    self._log(f'Espace insuffisant : {needed_gb:.2f} Go requis, {free_gb:.2f} Go disponibles.')
+                    def _abort_nds(n=needed_gb, f2=free_gb):
+                        mb.showerror('Espace insuffisant',
+                                     f'Espace requis : {n:.2f} Go\n'
+                                     f'Espace disponible : {f2:.2f} Go\n\n'
+                                     'Annulation de la copie NDS.', parent=self)
+                        self._start_btn.config(state=tk.NORMAL)
+                        self._cancel_btn.config(state=tk.DISABLED)
+                    self.after(0, _abort_nds)
+                    return
+            except OSError:
+                pass  # Si le disque n'est pas accessible, on tente quand même
+
+            # --- Copie ---
+            for pack_name in packs_to_copy:
+                if cancelled[0]:
+                    break
+                nds_pack = config_snap.get('nds_packs', {}).get(pack_name)
+                if not nds_pack:
+                    self._log(f'Pack "{pack_name}" introuvable, ignoré.')
+                    continue
+                if len(packs_to_copy) > 1:
+                    self._log(f'▶ Pack NDS {pack_name}...')
+                copier = NDSCopier(
+                    source_root=join(source_root, nds_pack.get('folder', '').rstrip('/\\')),
+                    base_folder=nds_pack.get('base_folder', 'Base NDS'),
+                    language_folders=nds_pack.get('languages', {}),
+                )
+                copier.event.on_log += self._log
+                copier.event.on_progress += self._update_progress
+                copier.event.on_done += lambda e, s, d, c: (
+                    self._log(f'  {int(e)//60}m{int(e)%60:02d}s — {s/(1024**2):.1f} Mo/s')
+                    if not c else None
+                )
+                copier.event.on_error += lambda msg: self._log(f'Erreur : {msg}')
+                copier.start(language, target_path, cancelled)
+
+            if cancelled[0]:
+                self._log('Copie annulée.')
+            else:
+                self._log(f'Copie NDS terminée → {target_path}')
+            self.after(0, lambda: (
+                self._start_btn.config(state=tk.NORMAL),
+                self._cancel_btn.config(state=tk.DISABLED),
+            ))
+
+        Thread(target=do_copy, daemon=True).start()
+
+    def _cancel(self):
+        self._cancelled[0] = True
+        self._cancel_btn.config(state=tk.DISABLED)
+        self._log('Annulation en cours...')
+
+
+class CustomPackFrame(ttk.Frame):
+    NUM_PACKS = 5
+
+    def __init__(self, parent, config):
+        super().__init__(parent)
+        self.config = config
+        self._cancelled = [False]
+
+        self.rowconfigure(2, weight=1)
+        self.columnconfigure(0, weight=1)
+
+        # --- Destination ---
+        dest_frame = ttk.LabelFrame(self, text='Destination (carte SD)')
+        dest_frame.grid(row=0, column=0, sticky=tk.EW, padx=10, pady=10)
+
+        ttk.Label(dest_frame, text='Lecteur :').grid(row=0, column=0, sticky=tk.W, padx=(8, 4), pady=5)
+        _dc2 = ttk.Frame(dest_frame)
+        _dc2.grid(row=0, column=1, sticky=tk.W, padx=(0, 8), pady=5)
+
+        drives_info = _drive_combo_values()
+        self._drive_combo = ttk.Combobox(_dc2, values=drives_info, state='readonly', width=30)
+        self._drive_combo.current(0)  # (Aucun) par défaut
+        self._drive_combo.grid(row=0, column=0, padx=(0, 3))
+
+        def _refresh_cp():
+            cur = self._drive_combo.get()
+            info = _drive_combo_values()
+            self._drive_combo.configure(values=info)
+            self._drive_combo.current(info.index(cur) if cur in info else 0)
+
+        ttk.Button(_dc2, text='↻', width=3, command=_refresh_cp).grid(row=0, column=1)
+
+        # --- Packs ---
+        packs_frame = ttk.LabelFrame(self, text='Packs à copier (le contenu sera copié à la racine de la SD)')
+        packs_frame.grid(row=1, column=0, sticky=tk.EW, padx=10, pady=(0, 10))
+        packs_frame.columnconfigure(2, weight=1)  # colonne chemin extensible
+
+        # En-tête des colonnes
+        ttk.Label(packs_frame, text='Nom du pack', foreground='grey').grid(
+            row=0, column=1, padx=(2, 5), pady=(4, 0), sticky=tk.W)
+        ttk.Label(packs_frame, text='Chemin source', foreground='grey').grid(
+            row=0, column=2, padx=5, pady=(4, 0), sticky=tk.W)
+
+        # Chargement : formats supportés :
+        #   {'path':..,'enabled':..,'name':..}  (nouveau)
+        #   {'path':..,'enabled':..}            (intermédiaire)
+        #   chaîne directe                      (ancien)
+        def _parse_pack(item):
+            if isinstance(item, dict):
+                return (bool(item.get('enabled', False)),
+                        str(item.get('name', '')),
+                        str(item.get('path', '')))
+            return bool(item), '', str(item)
+
+        saved_packs = config.get('custom_packs', [])
+        self._pack_entries = []
+
+        for i in range(self.NUM_PACKS):
+            raw = saved_packs[i] if i < len(saved_packs) else ''
+            enabled_init, name_init, path_init = _parse_pack(raw)
+            enabled_var = tk.IntVar(value=int(enabled_init))
+            name_var = tk.StringVar(value=name_init)
+            path_var = tk.StringVar(value=path_init)
+            row = i + 1  # ligne 0 = en-tête
+
+            ttk.Checkbutton(packs_frame, text=f'{i + 1}',
+                            variable=enabled_var).grid(row=row, column=0, sticky=tk.W,
+                                                       padx=(5, 2), pady=3)
+            name_entry = ttk.Entry(packs_frame, textvariable=name_var, width=16)
+            name_entry.grid(row=row, column=1, padx=(2, 5), pady=3)
+            name_entry.bind('<FocusOut>', lambda e: self._save_paths())
+
+            path_entry = ttk.Entry(packs_frame, textvariable=path_var)
+            path_entry.grid(row=row, column=2, sticky=tk.EW, padx=5, pady=3)
+            path_entry.bind('<FocusOut>', lambda e: self._save_paths())
+
+            def browse(var=path_var):
+                path = fd.askdirectory(parent=self, title='Sélectionner le dossier source',
+                                       mustexist=True)
+                if path:
+                    var.set(path)
+                    self._save_paths()
+
+            ttk.Button(packs_frame, text='...', command=browse).grid(
+                row=row, column=3, padx=(0, 3), pady=3)
+            ttk.Button(packs_frame, text='×', width=2,
+                       command=lambda v=path_var, nv=name_var, ev=enabled_var: (
+                           v.set(''), nv.set(''), ev.set(0), self._save_paths()
+                       )).grid(row=row, column=4, padx=(0, 5), pady=3)
+            self._pack_entries.append((enabled_var, name_var, path_var))
+
+        save_row = self.NUM_PACKS + 1  # +1 pour l'en-tête
+        self._save_status = ttk.Label(packs_frame, text='', foreground='green')
+        self._save_status.grid(row=save_row, column=2, sticky=tk.W, padx=5, pady=(4, 2))
+        ttk.Button(packs_frame, text='Enregistrer les chemins',
+                   command=self._save_paths).grid(row=save_row, column=3, columnspan=2,
+                                                  padx=(0, 5), pady=(4, 2))
+
+        # --- Progression ---
+        prog_frame = ttk.LabelFrame(self, text='Progression')
+        prog_frame.grid(row=2, column=0, sticky=tk.NSEW, padx=10, pady=(0, 10))
+        prog_frame.rowconfigure(3, weight=1)
+        prog_frame.columnconfigure(0, weight=1)
+
+        self._progress_var = tk.DoubleVar()
+        ttk.Progressbar(prog_frame, variable=self._progress_var, maximum=100).grid(
+            row=0, column=0, columnspan=2, sticky=tk.EW, padx=10, pady=(5, 0))
+
+        self._progress_label = ttk.Label(prog_frame, text='En attente...')
+        self._progress_label.grid(row=1, column=0, sticky=tk.W, padx=10)
+
+        self._file_label = ttk.Label(prog_frame, text='', foreground='grey')
+        self._file_label.grid(row=2, column=0, sticky=tk.W, padx=10)
+
+        log_scroll = ttk.Scrollbar(prog_frame, orient=tk.VERTICAL)
+        log_scroll.grid(row=3, column=1, sticky=tk.NSEW)
+        self._log_text = tk.Text(prog_frame, height=6, state=tk.DISABLED,
+                                  wrap='word', yscrollcommand=log_scroll.set)
+        self._log_text.grid(row=3, column=0, sticky=tk.NSEW, padx=(10, 0), pady=5)
+        log_scroll.config(command=self._log_text.yview)
+
+        # --- Boutons ---
+        btn_frame = ttk.Frame(self)
+        btn_frame.grid(row=3, column=0, pady=10)
+
+        self._start_btn = ttk.Button(btn_frame, text='Démarrer la copie', command=self._start)
+        self._start_btn.grid(row=0, column=0, padx=5)
+
+        self._cancel_btn = ttk.Button(btn_frame, text='Annuler', command=self._cancel,
+                                       state=tk.DISABLED)
+        self._cancel_btn.grid(row=0, column=1, padx=5)
+
+    def _save_paths(self):
+        self.config['custom_packs'] = [
+            {'path': pv.get().strip(), 'enabled': bool(ev.get()), 'name': nv.get().strip()}
+            for ev, nv, pv in self._pack_entries
+        ]
+        save_config(self.config)
+        self._save_status.config(text='Enregistré.')
+        self.after(2000, lambda: self._save_status.config(text=''))
+
+    def _log(self, message):
+        # Peut être appelé depuis le thread de copie → planifié sur le thread principal
+        def _do():
+            self._log_text.configure(state=tk.NORMAL)
+            self._log_text.insert(tk.END, message + '\n')
+            self._log_text.see(tk.END)
+            self._log_text.configure(state=tk.DISABLED)
+        self.after(0, _do)
+
+    def _copy_contents(self, src, target_path, cancelled, state):
+        for dirpath, _, filenames in walk(src):
+            if cancelled[0]:
+                return
+            rel = relpath(dirpath, src)
+            dest_dir = target_path if rel == '.' else join(target_path, rel)
+            makedirs(dest_dir, exist_ok=True)
+            for filename in filenames:
+                if cancelled[0]:
+                    return
+                src_file = join(dirpath, filename)
+                dst_file = join(dest_dir, filename)
+                try:
+                    file_size = getsize(src_file)
+                except OSError:
+                    file_size = 0
+                shutil.copy2(src_file, dst_file)
+                state['copied'] += file_size
+                now = time.time()
+                # Throttle : max ~10 mises à jour/sec pour ne pas saturer l'event loop
+                if now - state.get('_last_ui', 0) >= 0.1:
+                    state['_last_ui'] = now
+                    elapsed = now - state['start']
+                    speed = state['copied'] / elapsed if elapsed > 0 else 0
+                    pct = (state['copied'] / state['total'] * 100) if state['total'] > 0 else 0
+                    label = (f'{pct:.1f}%  —  {state["copied"] / (1024 ** 3):.2f} Go'
+                             f' / {state["total"] / (1024 ** 3):.2f} Go'
+                             f'  —  {speed / (1024 ** 2):.1f} Mo/s')
+                    self.after(0, lambda p=pct, t=label, f=filename: (
+                        self._progress_var.set(p),
+                        self._progress_label.config(text=t),
+                        self._file_label.config(text=f),
+                    ))
+
+    def _run_copy(self, sources, target_path, cancelled):
+        total = 0
+        for src in sources:
+            if isdir(src):
+                for dirpath, _, filenames in walk(src):
+                    for f in filenames:
+                        try:
+                            total += getsize(join(dirpath, f))
+                        except OSError:
+                            pass
+            else:
+                self._log(f'Dossier introuvable (ignoré) : {src}')
+
+        self._log(f'Taille totale : {total / (1024 ** 3):.2f} Go')
+
+        # Vérification de l'espace disponible sur la destination
+        try:
+            free = shutil.disk_usage(target_path).free
+            if total > free:
+                needed_gb = total / (1024 ** 3)
+                free_gb = free / (1024 ** 3)
+                self._log(f'Espace insuffisant : {needed_gb:.2f} Go requis, {free_gb:.2f} Go disponibles.')
+                def _abort_cp(n=needed_gb, f2=free_gb):
+                    mb.showerror('Espace insuffisant',
+                                 f'Espace requis : {n:.2f} Go\n'
+                                 f'Espace disponible : {f2:.2f} Go\n\n'
+                                 'Annulation de la copie.', parent=self)
+                    self._start_btn.config(state=tk.NORMAL)
+                    self._cancel_btn.config(state=tk.DISABLED)
+                self.after(0, _abort_cp)
+                return
+        except OSError:
+            pass  # Si le disque n'est pas accessible, on tente quand même
+
+        state = {'copied': 0, 'total': total, 'start': time.time()}
+
+        for src in sources:
+            if cancelled[0]:
+                break
+            if not isdir(src):
+                continue
+            self._log(f'Copie de : {src}')
+            self._copy_contents(src, target_path, cancelled, state)
+
+        elapsed = time.time() - state['start']
+        m, s = divmod(int(elapsed), 60)
+        if cancelled[0]:
+            self._log('Copie annulée.')
+            self.after(0, lambda: self._progress_label.config(text='Annulé.'))
+        else:
+            avg_speed = state['copied'] / elapsed if elapsed > 0 else 0
+            self._log(f'Terminé en {m}m{s:02d}s  —  Débit moyen : {avg_speed / (1024 ** 2):.1f} Mo/s')
+            self._log(f'Destination : {target_path}')
+            self.after(0, lambda: self._progress_label.config(text='Terminé.'))
+
+        self.after(0, lambda: (
+            self._start_btn.config(state=tk.NORMAL),
+            self._cancel_btn.config(state=tk.DISABLED),
+        ))
+
+    def _start(self):
+        dest = self._drive_combo.get().strip()
+        if not dest:
+            mb.showerror('Erreur', 'Veuillez sélectionner un lecteur.', parent=self)
+            return
+
+        target_path = _drive_to_path(dest) if is_windows else dest
+
+        sources = [pv.get().strip() for ev, pv in self._pack_entries
+                   if ev.get() and pv.get().strip()]
+        if not sources:
+            mb.showerror('Erreur', 'Aucun pack activé ou configuré.', parent=self)
+            return
+
+        self._save_paths()
+
+        self._cancelled = [False]
+        self._log_text.configure(state=tk.NORMAL)
+        self._log_text.delete('1.0', tk.END)
+        self._log_text.configure(state=tk.DISABLED)
+        self._progress_var.set(0)
+        self._progress_label.config(text='Calcul de la taille...')
+        self._file_label.config(text='')
+        self._start_btn.config(state=tk.DISABLED)
+        self._cancel_btn.config(state=tk.NORMAL)
+
+        cancelled = self._cancelled
+        Thread(target=lambda: self._run_copy(sources, target_path, cancelled), daemon=True).start()
+
+    def _cancel(self):
+        self._cancelled[0] = True
+        self._cancel_btn.config(state=tk.DISABLED)
+        self._log('Annulation en cours...')
+
+
+class SettingsFrame(ttk.Frame):
+    def __init__(self, parent, config):
+        super().__init__(parent)
+        self.config = config
+        self.columnconfigure(0, weight=1)
+        self.rowconfigure(1, weight=1)  # row 1 = zone scrollable
+
+        # ---- Section Profils (fixe, toujours visible) ----
+        self._profiles = load_profiles()
+        prof_sec = ttk.LabelFrame(self, text='Profils de configuration')
+        prof_sec.grid(row=0, column=0, columnspan=2, sticky=tk.EW, padx=10, pady=(8, 4))
+        prof_sec.columnconfigure(0, weight=1)
+
+        self._profile_var = tk.StringVar()
+        self._profile_combo = ttk.Combobox(prof_sec, textvariable=self._profile_var,
+                                            state='readonly', width=32)
+        self._profile_combo.grid(row=0, column=0, padx=(10, 5), pady=8, sticky=tk.W)
+
+        ttk.Button(prof_sec, text='Charger', command=self._load_profile).grid(
+            row=0, column=1, padx=3, pady=8)
+        ttk.Button(prof_sec, text='Enregistrer sous...', command=self._save_profile_as).grid(
+            row=0, column=2, padx=3, pady=8)
+        ttk.Button(prof_sec, text='Supprimer', command=self._delete_profile).grid(
+            row=0, column=3, padx=(3, 10), pady=8)
+
+        self._refresh_profile_combo()
+
+        # ---- Zone scrollable ----
+        canvas = tk.Canvas(self, highlightthickness=0)
+        vscroll = ttk.Scrollbar(self, orient=tk.VERTICAL, command=canvas.yview)
+        canvas.configure(yscrollcommand=vscroll.set)
+        canvas.grid(row=1, column=0, sticky=tk.NSEW)
+        vscroll.grid(row=1, column=1, sticky=tk.NS)
+
+        body = ttk.Frame(canvas)
+        body.columnconfigure(0, weight=1)
+        cw = canvas.create_window((0, 0), window=body, anchor=tk.NW)
+
+        body.bind('<Configure>', lambda e: canvas.configure(scrollregion=canvas.bbox('all')))
+        canvas.bind('<Configure>', lambda e: canvas.itemconfig(cw, width=e.width))
+        canvas.bind_all('<MouseWheel>',
+                        lambda e: canvas.yview_scroll(int(-1 * (e.delta / 120)), 'units'))
+
+        _row = [0]  # mutable counter
+
+        def next_row():
+            r = _row[0]; _row[0] += 1; return r
+
+        def make_picker(parent, var, pr, pc):
+            """Ligne [entry][...][×] — chemin absolu (ex : source_root)."""
+            ttk.Entry(parent, textvariable=var, width=30).grid(
+                row=pr, column=pc, sticky=tk.EW, padx=5, pady=3)
+            ttk.Button(parent, text='...', width=3,
+                       command=lambda: self._browse(var)).grid(
+                row=pr, column=pc + 1, padx=(0, 3), pady=3)
+            ttk.Button(parent, text='×', width=2,
+                       command=lambda: var.set('')).grid(
+                row=pr, column=pc + 2, padx=(0, 8), pady=3)
+
+        def make_rel_picker(parent, var, get_base, pr, pc):
+            """Ligne [entry][...][×] — ouvre depuis get_base(), stocke le chemin relatif."""
+            ttk.Entry(parent, textvariable=var, width=22).grid(
+                row=pr, column=pc, sticky=tk.EW, padx=5, pady=3)
+            def _browse():
+                base = get_base()
+                init = base if base and isdir(base) else None
+                path = fd.askdirectory(parent=self, title='Sélectionner le dossier',
+                                       mustexist=True, initialdir=init)
+                if not path:
+                    return
+                if base and isdir(base):
+                    try:
+                        rel = relpath(path, base)
+                        if not rel.startswith('..'):
+                            var.set(rel)
+                            return
+                    except ValueError:
+                        pass
+                var.set(path)
+            ttk.Button(parent, text='...', width=3, command=_browse).grid(
+                row=pr, column=pc + 1, padx=(0, 3), pady=3)
+            ttk.Button(parent, text='×', width=2,
+                       command=lambda: var.set('')).grid(
+                row=pr, column=pc + 2, padx=(0, 8), pady=3)
+
+        def make_clear_entry(parent, var, get_base, pr, pc):
+            """Ligne [entry][...][×] — sous-dossier relatif à get_base()."""
+            ttk.Entry(parent, textvariable=var, width=25).grid(
+                row=pr, column=pc, sticky=tk.EW, padx=5, pady=3)
+            def _browse():
+                base = get_base()
+                init = base if base and isdir(base) else None
+                path = fd.askdirectory(parent=self, title='Sélectionner le sous-dossier',
+                                       mustexist=True, initialdir=init)
+                if not path:
+                    return
+                if base and isdir(base):
+                    try:
+                        rel = relpath(path, base)
+                        if not rel.startswith('..'):
+                            var.set(rel)
+                            return
+                    except ValueError:
+                        pass
+                var.set(path)
+            ttk.Button(parent, text='...', width=3, command=_browse).grid(
+                row=pr, column=pc + 1, padx=(0, 3), pady=3)
+            ttk.Button(parent, text='×', width=2,
+                       command=lambda: var.set('')).grid(
+                row=pr, column=pc + 2, padx=(0, 8), pady=3)
+
+        # ---- Section Dossiers source ----
+        src_sec = ttk.LabelFrame(body, text='Dossiers source')
+        src_sec.grid(row=next_row(), column=0, sticky=tk.EW, padx=10, pady=(10, 5))
+        src_sec.columnconfigure(1, weight=1)
+
+        ttk.Label(src_sec, text='Source commune :').grid(
+            row=0, column=0, sticky=tk.W, padx=10, pady=(8, 3))
+        self._source_var = tk.StringVar(value=config.get('source_root', ''))
+        make_picker(src_sec, self._source_var, 0, 1)
+        ttk.Label(src_sec, text='Utilisée par les packs CIA et NDS si "Source NDS" est vide.',
+                  foreground='grey').grid(row=1, column=1, columnspan=3, sticky=tk.W, padx=5, pady=(0, 4))
+
+        ttk.Label(src_sec, text='Source NDS (optionnel) :').grid(
+            row=2, column=0, sticky=tk.W, padx=10, pady=3)
+        self._nds_source_var = tk.StringVar(value=config.get('nds_source_root', ''))
+        make_picker(src_sec, self._nds_source_var, 2, 1)
+        ttk.Label(src_sec, text='Si rempli, remplace la source commune pour les packs NDS.',
+                  foreground='grey').grid(row=3, column=1, columnspan=3, sticky=tk.W, padx=5, pady=(0, 8))
+
+        # ---- Sections Pack NDS ----
+        self._nds_pack_vars = {}
+        nds_packs = config.get('nds_packs', {})
+
+        for pack_name, pack_data in nds_packs.items():
+            sec = ttk.LabelFrame(body, text=f'Pack NDS — {pack_name}')
+            sec.grid(row=next_row(), column=0, sticky=tk.EW, padx=10, pady=5)
+            sec.columnconfigure(1, weight=1)
+            self._nds_pack_vars[pack_name] = {'languages': {}}
+
+            ttk.Label(sec, text='Dossier du pack :').grid(
+                row=0, column=0, sticky=tk.W, padx=10, pady=(8, 3))
+            folder_var = tk.StringVar(value=pack_data.get('folder', ''))
+            make_rel_picker(sec, folder_var,
+                            lambda: (self._nds_source_var.get().strip()
+                                     or self._source_var.get().strip()),
+                            0, 1)
+            self._nds_pack_vars[pack_name]['folder'] = folder_var
+
+            ttk.Label(sec, text='Dossier de base :').grid(
+                row=1, column=0, sticky=tk.W, padx=10, pady=3)
+            base_var = tk.StringVar(value=pack_data.get('base_folder', 'Base NDS'))
+            make_clear_entry(sec, base_var,
+                             lambda fv=folder_var: join(
+                                 self._nds_source_var.get().strip()
+                                 or self._source_var.get().strip(),
+                                 fv.get().strip()),
+                             1, 1)
+            self._nds_pack_vars[pack_name]['base_folder'] = base_var
+
+            ttk.Separator(sec, orient=tk.HORIZONTAL).grid(
+                row=2, column=0, columnspan=4, sticky=tk.EW, padx=10, pady=5)
+            ttk.Label(sec, text='Dossiers par langue', font=('', 9, 'bold')).grid(
+                row=3, column=0, columnspan=4, sticky=tk.W, padx=10, pady=(0, 3))
+
+            for li, (lang, folder) in enumerate(pack_data.get('languages', {}).items()):
+                ttk.Label(sec, text=f'{lang} :').grid(
+                    row=4 + li, column=0, sticky=tk.W, padx=22, pady=2)
+                lv = tk.StringVar(value=folder)
+                make_clear_entry(sec, lv,
+                                 lambda fv=folder_var: join(
+                                     self._nds_source_var.get().strip()
+                                     or self._source_var.get().strip(),
+                                     fv.get().strip()),
+                                 4 + li, 1)
+                self._nds_pack_vars[pack_name]['languages'][lang] = lv
+
+        # ---- Sections Pack CIA (une par taille, comme les packs NDS) ----
+        cia_packs = config.get('cia_packs', {})
+        pack_order = config.get('cia_pack_order', list(cia_packs.keys()))
+
+        # Variantes (hors 'folder') dans l'ordre d'apparition du premier pack
+        all_variants = []
+        for sd in cia_packs.values():
+            for k in sd:
+                if k != 'folder' and k not in all_variants:
+                    all_variants.append(k)
+
+        self._cia_vars = {}
+        for pack_name in pack_order:
+            pack_data = cia_packs.get(pack_name, {})
+            sec = ttk.LabelFrame(body, text=f'Pack CIA — {pack_name}')
+            sec.grid(row=next_row(), column=0, sticky=tk.EW, padx=10, pady=5)
+            sec.columnconfigure(1, weight=1)
+            self._cia_vars[pack_name] = {}
+
+            ttk.Label(sec, text='Dossier du pack :').grid(
+                row=0, column=0, sticky=tk.W, padx=10, pady=(8, 3))
+            folder_var = tk.StringVar(value=pack_data.get('folder', ''))
+            make_rel_picker(sec, folder_var,
+                            lambda: self._source_var.get().strip(),
+                            0, 1)
+            self._cia_vars[pack_name]['folder'] = folder_var
+
+            ttk.Separator(sec, orient=tk.HORIZONTAL).grid(
+                row=1, column=0, columnspan=4, sticky=tk.EW, padx=10, pady=5)
+            ttk.Label(sec, text='Sous-dossiers par variante', font=('', 9, 'bold')).grid(
+                row=2, column=0, columnspan=4, sticky=tk.W, padx=10, pady=(0, 3))
+
+            for vi, variant in enumerate(all_variants):
+                ttk.Label(sec, text=f'{variant} :').grid(
+                    row=3 + vi, column=0, sticky=tk.W, padx=22, pady=2)
+                var = tk.StringVar(value=pack_data.get(variant, ''))
+                make_clear_entry(sec, var,
+                                 lambda fv=folder_var: join(
+                                     self._source_var.get().strip(),
+                                     fv.get().strip()),
+                                 3 + vi, 1)
+                self._cia_vars[pack_name][variant] = var
+
+        # Spacer bas
+        ttk.Frame(body).grid(row=next_row(), column=0, pady=5)
+
+        # ---- Bouton Enregistrer (hors zone scroll) ----
+        bot = ttk.Frame(self)
+        bot.grid(row=2, column=0, columnspan=2, pady=8)
+        ttk.Button(bot, text='Enregistrer', command=self._save).grid(row=0, column=0, padx=10)
+        self._status = ttk.Label(bot, text='', foreground='green')
+        self._status.grid(row=0, column=1)
+
+    def _browse(self, var):
+        path = fd.askdirectory(parent=self, title='Sélectionner le dossier', mustexist=True)
+        if path:
+            var.set(path)
+
+    def _refresh_profile_combo(self, select=None):
+        names = sorted(self._profiles.keys())
+        self._profile_combo.configure(values=names)
+        if select and select in names:
+            self._profile_var.set(select)
+        elif names:
+            self._profile_combo.current(0)
+        else:
+            self._profile_var.set('')
+
+    def _load_profile(self):
+        name = self._profile_var.get()
+        if not name or name not in self._profiles:
+            mb.showwarning('Profils', 'Veuillez sélectionner un profil.', parent=self)
+            return
+        data = self._profiles[name]
+        if 'source_root' in data:
+            self._source_var.set(data['source_root'])
+        if 'nds_source_root' in data:
+            self._nds_source_var.set(data['nds_source_root'])
+        for pack_name, pack_vars in self._nds_pack_vars.items():
+            pd = data.get('nds_packs', {}).get(pack_name, {})
+            if 'folder' in pd:
+                pack_vars['folder'].set(pd['folder'])
+            if 'base_folder' in pd:
+                pack_vars['base_folder'].set(pd['base_folder'])
+            for lang, var in pack_vars['languages'].items():
+                if lang in pd.get('languages', {}):
+                    var.set(pd['languages'][lang])
+        for size, variants in self._cia_vars.items():
+            pd_cia = data.get('cia_packs', {}).get(size, {})
+            for variant, var in variants.items():
+                if variant in pd_cia:
+                    var.set(pd_cia[variant])
+        self._save()
+        self._status.config(text=f'Profil "{name}" chargé.')
+        self.after(3000, lambda: self._status.config(text=''))
+
+    def _save_profile_as(self):
+        import tkinter.simpledialog as sd_dlg
+        name = sd_dlg.askstring('Enregistrer le profil', 'Nom du profil :', parent=self)
+        if not name or not name.strip():
+            return
+        name = name.strip()
+        data = {
+            'source_root': self._source_var.get().strip(),
+            'nds_source_root': self._nds_source_var.get().strip(),
+            'nds_packs': {},
+            'cia_packs': {},
+        }
+        for pack_name, pack_vars in self._nds_pack_vars.items():
+            data['nds_packs'][pack_name] = {
+                'folder': pack_vars['folder'].get().strip(),
+                'base_folder': pack_vars['base_folder'].get().strip(),
+                'languages': {lang: var.get().strip()
+                              for lang, var in pack_vars['languages'].items()},
+            }
+        for size, variants in self._cia_vars.items():
+            data['cia_packs'][size] = {variant: var.get().strip()
+                                       for variant, var in variants.items()}
+        self._profiles[name] = data
+        save_profiles(self._profiles)
+        self._refresh_profile_combo(select=name)
+        self._status.config(text=f'Profil "{name}" enregistré.')
+        self.after(3000, lambda: self._status.config(text=''))
+
+    def _delete_profile(self):
+        name = self._profile_var.get()
+        if not name or name not in self._profiles:
+            mb.showwarning('Profils', 'Veuillez sélectionner un profil.', parent=self)
+            return
+        if not mb.askyesno('Supprimer le profil', f'Supprimer le profil "{name}" ?', parent=self):
+            return
+        del self._profiles[name]
+        save_profiles(self._profiles)
+        self._refresh_profile_combo()
+        self._status.config(text=f'Profil "{name}" supprimé.')
+        self.after(3000, lambda: self._status.config(text=''))
+
+    def _save(self):
+        self.config['source_root'] = self._source_var.get().strip()
+        self.config['nds_source_root'] = self._nds_source_var.get().strip()
+        for pack_name, pack_vars in self._nds_pack_vars.items():
+            if pack_name not in self.config['nds_packs']:
+                self.config['nds_packs'][pack_name] = {}
+            self.config['nds_packs'][pack_name]['folder'] = pack_vars['folder'].get().strip()
+            self.config['nds_packs'][pack_name]['base_folder'] = pack_vars['base_folder'].get().strip()
+            for lang, var in pack_vars['languages'].items():
+                self.config['nds_packs'][pack_name]['languages'][lang] = var.get().strip()
+        for size, variants in self._cia_vars.items():
+            if size not in self.config['cia_packs']:
+                self.config['cia_packs'][size] = {}
+            for variant, var in variants.items():
+                self.config['cia_packs'][size][variant] = var.get().strip()
+        save_config(self.config)
+        self._status.config(text='Enregistré.')
+        self.after(3000, lambda: self._status.config(text=''))
+
+
 def main():
-    if not (save3ds_fuse_path and isfile(save3ds_fuse_path)):
-        mb.showerror('Error', "Couldn't find save3ds_fuse. Please place it PATH.")
-        return
+    config = load_config()
 
     window = tk.Tk()
-    window.title(f'custom-install {__version__}')
-    frame = CustomInstallGUI(window)
-    frame.pack(fill=tk.BOTH, expand=True)
+    window.title('3DS Hack Custom CnC v1')
+
+    if not (save3ds_fuse_path and isfile(save3ds_fuse_path)):
+        mb.showwarning('Avertissement',
+                       "save3ds_fuse est introuvable.\n"
+                       "L'installation de fichiers CIA ne sera pas disponible.")
+
+    notebook = ttk.Notebook(window)
+    notebook.pack(fill=tk.BOTH, expand=True)
+
+    install_tab = CustomInstallGUI(notebook, config)
+    notebook.add(install_tab, text='Installation CIA')
+
+    nds_tab = NDSCopyFrame(notebook, config)
+    notebook.add(nds_tab, text='Copie Pack NDS')
+
+    custom_tab = CustomPackFrame(notebook, config)
+    notebook.add(custom_tab, text='Packs Customs')
+
+    settings_tab = SettingsFrame(notebook, config)
+    notebook.add(settings_tab, text='Paramètres')
+
     window.mainloop()
 
 
