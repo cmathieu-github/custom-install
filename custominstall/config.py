@@ -22,6 +22,7 @@ _NDS_LANGUAGES = {
 }
 
 DEFAULTS = {
+    'max_drive_size_gb': 1100,     # Disques plus grands jamais proposés (1100 Go = 1,1 To)
     'source_root': '',
     'nds_source_root': '',          # Si rempli, remplace source_root pour les packs NDS
     'nds_pack_order': ['32 Go', '64 Go+'],  # Ordre pour la logique additive NDS

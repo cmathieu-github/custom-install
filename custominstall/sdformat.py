@@ -27,19 +27,34 @@ from os.path import abspath, dirname
 is_windows = sys.platform == 'win32'
 
 CLUSTER_SIZE = 32 * 1024                 # 32 Ko, format attendu par la 3DS
-MAX_DISK_BYTES = int(1.1 * 1000 ** 4)    # 1,1 To : au-delà ce n'est pas une SD de 3DS
 FORBIDDEN_LETTERS = {'C', 'D'}           # jamais proposés, quoi qu'il arrive
-ALLOWED_BUS_TYPES = {'USB', 'SD', 'MMC', 'SCSI'}  # lecteurs de cartes USB / internes
+DEFAULT_MAX_SIZE_GB = 1100               # 1,1 To, réglable dans Paramètres (max_drive_size_gb)
 KEEP_ON_CLEAR = {'system volume information', '$recycle.bin'}
 
-DRIVE_REMOVABLE = 2
-DRIVE_FIXED = 3
+ERROR_NOT_READY = 21                     # lecteur de cartes sans carte
 
 _APP_ROOT = dirname(dirname(abspath(__file__)))
 
 
 class SDFormatError(Exception):
     pass
+
+
+def max_bytes_from_config(config):
+    """Limite de taille des disques proposés, en octets (Go décimaux, comme les SD)."""
+    try:
+        gb = float(str((config or {}).get('max_drive_size_gb', DEFAULT_MAX_SIZE_GB)).replace(',', '.'))
+    except ValueError:
+        gb = DEFAULT_MAX_SIZE_GB
+    if gb <= 0:
+        gb = DEFAULT_MAX_SIZE_GB
+    return int(gb * 1000 ** 3)
+
+
+def format_limit(max_bytes):
+    gb = max_bytes / 1000 ** 3
+    text = f'{gb:g} Go' if gb < 1000 else f'{gb / 1000:g} To'
+    return text.replace('.', ',')
 
 
 # --------------------------------------------------------------------------- #
@@ -51,9 +66,7 @@ class DriveInfo:
     label: str = ''
     fs: str = ''
     cluster: int = 0
-    size: int = 0          # taille du volume
-    disk_size: int = 0     # taille du disque physique qui le porte
-    bus: str = ''
+    size: int = 0          # taille du volume (0 = inconnue)
     safe: bool = False
     reason: str = ''
 
@@ -61,13 +74,19 @@ class DriveInfo:
     def root(self):
         return self.letter + ':\\'
 
+    @property
+    def raw(self):
+        return self.fs == 'RAW'
+
     def display(self):
         parts = []
         if self.label:
             parts.append(self.label)
         if self.size:
             parts.append(human_size(self.size))
-        if self.fs:
+        if self.raw:
+            parts.append('non formatée')
+        elif self.fs:
             fs = self.fs
             if self.cluster:
                 fs += f' {self.cluster // 1024} Ko'
@@ -82,25 +101,31 @@ def human_size(n):
 
 
 def _volume_info(letter):
-    """Système de fichiers, nom, taille de cluster et taille d'un volume (ctypes, rapide)."""
+    """Système de fichiers, nom, taille de cluster et taille d'un volume (ctypes, rapide).
+    None si le lecteur ne contient pas de carte ; fs = 'RAW' si la carte n'est pas lisible
+    (jamais formatée ou système de fichiers abîmé : elle doit rester formatable)."""
     import ctypes as ct
     import ctypes.wintypes as wt
-    k32 = ct.windll.kernel32
+    k32 = ct.WinDLL('kernel32', use_last_error=True)
     root = letter + ':\\'
-    info = {'drive_type': k32.GetDriveTypeW(root)}
     name = ct.create_unicode_buffer(261)
     fs = ct.create_unicode_buffer(261)
-    if not k32.GetVolumeInformationW(root, name, 261, None, None, None, fs, 261):
-        return None  # pas de média (lecteur de carte vide) ou volume illisible
-    info['label'] = name.value.strip()
-    info['fs'] = fs.value.strip()
-    spc, bps, free_c, total_c = wt.DWORD(), wt.DWORD(), wt.DWORD(), wt.DWORD()
-    if k32.GetDiskFreeSpaceW(root, ct.byref(spc), ct.byref(bps), ct.byref(free_c), ct.byref(total_c)):
-        info['cluster'] = spc.value * bps.value
-    total = ct.c_ulonglong(0)
-    if k32.GetDiskFreeSpaceExW(root, None, ct.byref(total), None):
-        info['size'] = total.value
-    return info
+    old_mode = k32.SetErrorMode(0x0001)  # pas de fenêtre « Insérez un disque » sur un lecteur vide
+    try:
+        if not k32.GetVolumeInformationW(root, name, 261, None, None, None, fs, 261):
+            if ct.get_last_error() == ERROR_NOT_READY:
+                return None
+            return {'label': '', 'fs': 'RAW', 'cluster': 0, 'size': 0}
+        info = {'label': name.value.strip(), 'fs': fs.value.strip(), 'cluster': 0, 'size': 0}
+        spc, bps, free_c, total_c = wt.DWORD(), wt.DWORD(), wt.DWORD(), wt.DWORD()
+        if k32.GetDiskFreeSpaceW(root, ct.byref(spc), ct.byref(bps), ct.byref(free_c), ct.byref(total_c)):
+            info['cluster'] = spc.value * bps.value
+        total = ct.c_ulonglong(0)
+        if k32.GetDiskFreeSpaceExW(root, None, ct.byref(total), None):
+            info['size'] = total.value
+        return info
+    finally:
+        k32.SetErrorMode(old_mode)
 
 
 _PS_DISKS = r"""
@@ -111,9 +136,8 @@ foreach ($p in Get-Partition) {
   if ($l -notmatch '^[A-Za-z]$') { continue }
   $d = Get-Disk -Number $p.DiskNumber
   $out += [pscustomobject]@{
-    Letter = $l.ToUpper(); DiskNumber = $p.DiskNumber; DiskSize = [int64]$d.Size;
-    IsSystem = [bool]$d.IsSystem; IsBoot = [bool]$d.IsBoot; BusType = [string]$d.BusType;
-    PartitionStyle = [string]$d.PartitionStyle; PartitionSize = [int64]$p.Size; MbrType = $p.MbrType
+    Letter = $l.ToUpper(); PartitionStyle = [string]$d.PartitionStyle;
+    PartitionSize = [int64]$p.Size; MbrType = $p.MbrType
   }
 }
 ConvertTo-Json -Compress -InputObject @($out)
@@ -126,8 +150,9 @@ def _powershell(script, timeout=30):
                           capture_output=True, text=True, timeout=timeout, creationflags=flags)
 
 
-def _disk_map():
-    """{lettre: infos du disque physique} via Storage (PowerShell). {} si indisponible."""
+def _partition_map():
+    """{lettre: infos de partition} via PowerShell. Sert uniquement pour les cartes non formatées
+    (taille) et pour corriger le type de partition après formatage. {} si indisponible."""
     data = []
     for attempt in range(2):  # le premier lancement de PowerShell est parfois lent / vide
         try:
@@ -142,53 +167,29 @@ def _disk_map():
     return {str(d.get('Letter', '')).upper(): d for d in data if d.get('Letter')}
 
 
-def _system_letters():
-    letters = set(FORBIDDEN_LETTERS)
-    for var in ('SystemDrive', 'SystemRoot', 'windir', 'ProgramFiles'):
-        val = os.environ.get(var, '')
-        if len(val) >= 2 and val[1] == ':':
-            letters.add(val[0].upper())
-    # Le lecteur qui héberge l'application elle-même et Python
-    for path in (_APP_ROOT, sys.executable):
-        if len(path) >= 2 and path[1] == ':':
-            letters.add(path[0].upper())
-    return letters
-
-
-def evaluate_drive(letter, vol, disk, system_letters):
-    """Construit un DriveInfo et décide s'il est sûr d'y écrire / de le formater."""
+def evaluate_drive(letter, vol, max_bytes):
+    """Construit un DriveInfo : seuls C:, D: et les disques au-delà de la limite sont exclus."""
     info = DriveInfo(letter=letter, label=vol.get('label', ''), fs=vol.get('fs', ''),
                      cluster=vol.get('cluster', 0), size=vol.get('size', 0))
-    if disk:
-        info.disk_size = int(disk.get('DiskSize') or 0)
-        info.bus = str(disk.get('BusType') or '')
-
-    if letter in system_letters:
-        info.reason = 'lecteur système ou de l’application'
-    elif vol.get('drive_type') not in (DRIVE_REMOVABLE, DRIVE_FIXED):
-        info.reason = 'lecteur réseau, CD ou virtuel'
-    elif not disk:
-        info.reason = 'informations disque indisponibles'
-    elif disk.get('IsSystem') or disk.get('IsBoot'):
-        info.reason = 'disque système'
-    elif max(info.disk_size, info.size) > MAX_DISK_BYTES:
-        info.reason = 'disque de plus de 1,1 To'
-    elif info.bus.upper() not in ALLOWED_BUS_TYPES:
-        info.reason = f'disque interne ({info.bus or "type inconnu"})'
+    if letter in FORBIDDEN_LETTERS:
+        info.reason = 'C: et D: ne sont jamais proposés'
+    elif not info.size:
+        info.reason = 'taille inconnue'
+    elif info.size > max_bytes:
+        info.reason = f'plus de {format_limit(max_bytes)}'
     else:
         info.safe = True
     return info
 
 
-def list_drives(include_unsafe=False):
-    """Liste les volumes présents ; par défaut uniquement ceux qui peuvent être une SD."""
+def list_drives(max_bytes, include_unsafe=False):
+    """Liste les lecteurs contenant une carte ; par défaut uniquement ceux autorisés."""
     if not is_windows:
         return []
     import ctypes as ct
     bitmask = ct.windll.kernel32.GetLogicalDrives()
     letters = [chr(65 + i) for i in range(26) if bitmask & (1 << i)]
-    disks = _disk_map()
-    system_letters = _system_letters()
+    partitions = None
     drives = []
     for letter in letters:
         if letter in ('A', 'B'):
@@ -196,18 +197,22 @@ def list_drives(include_unsafe=False):
         vol = _volume_info(letter)
         if vol is None:
             continue
-        info = evaluate_drive(letter, vol, disks.get(letter), system_letters)
+        if vol['fs'] == 'RAW' and not vol['size']:
+            if partitions is None:
+                partitions = _partition_map()
+            vol['size'] = int((partitions.get(letter) or {}).get('PartitionSize') or 0)
+        info = evaluate_drive(letter, vol, max_bytes)
         if info.safe or include_unsafe:
             drives.append(info)
     return drives
 
 
-def get_safe_drive(letter):
+def get_safe_drive(letter, max_bytes):
     """DriveInfo si le lecteur est autorisé, sinon lève SDFormatError avec la raison."""
     letter = (letter or '').strip()[:1].upper()
     if not letter:
         raise SDFormatError('Aucun lecteur sélectionné.')
-    for info in list_drives(include_unsafe=True):
+    for info in list_drives(max_bytes, include_unsafe=True):
         if info.letter == letter:
             if not info.safe:
                 raise SDFormatError(f'Le lecteur {letter}: est exclu ({info.reason}).')
@@ -224,12 +229,12 @@ def check_sd_format(letter):
     return fs.upper() == 'FAT32' and cluster == CLUSTER_SIZE, fs, cluster
 
 
-def clear_drive_contents(root, log=print, cancelled=None):
+def clear_drive_contents(root, max_bytes, log=print, cancelled=None):
     """Supprime tout le contenu à la racine d'une SD (sauf dossiers système Windows)."""
     root = os.path.abspath(root)
     if not (len(root) == 3 and root[1:] == ':\\'):
         raise SDFormatError(f'Refus de vider « {root} » : ce n’est pas la racine d’un lecteur.')
-    get_safe_drive(root[0])  # re-vérifie les exclusions juste avant de supprimer
+    get_safe_drive(root[0], max_bytes)  # re-vérifie les exclusions juste avant de supprimer
 
     def _on_error(func, path, exc_info):
         # Fichiers en lecture seule : on retire l'attribut et on réessaie
@@ -533,25 +538,27 @@ def is_admin():
         return False
 
 
-def format_drive(letter, label='3DS', expect_size=None, log=print):
+def format_drive(letter, label='3DS', expect_size=None, max_bytes=None, log=print):
     """Formate un lecteur SD en FAT32 32 Ko après avoir re-vérifié les exclusions."""
     if not is_windows:
         raise SDFormatError('Le formatage n’est disponible que sous Windows.')
-    info = get_safe_drive(letter)
+    max_bytes = max_bytes or max_bytes_from_config(None)
+    info = get_safe_drive(letter, max_bytes)
     letter = info.letter
     if expect_size and info.size and abs(int(expect_size) - info.size) > CLUSTER_SIZE * 64:
         raise SDFormatError('La carte présente dans le lecteur a changé depuis la confirmation. Abandon.')
 
-    log(f'Formatage de {letter}: ({human_size(info.size)}, {info.fs or "?"}) en FAT32 32 Ko...')
+    log(f'Formatage de {letter}: ({human_size(info.size)}, {"non formatée" if info.raw else info.fs or "?"}) '
+        'en FAT32 32 Ko...')
     target = VolumeTarget(letter, log=log)
     try:
-        if target.size_bytes > MAX_DISK_BYTES:
-            raise SDFormatError('Volume de plus de 1,1 To : abandon.')
+        if target.size_bytes > max_bytes:
+            raise SDFormatError(f'Volume de plus de {format_limit(max_bytes)} : abandon.')
         write_fat32(target, label, log=log)
     finally:
         target.close()
 
-    disk = _disk_map().get(letter, {})
+    disk = _partition_map().get(letter, {})
     if str(disk.get('PartitionStyle', '')).upper() == 'MBR' and disk.get('MbrType') not in (11, 12):
         # Type de partition 0x0C (FAT32 LBA) pour que tous les lecteurs la reconnaissent
         _powershell(f'Set-Partition -DriveLetter {letter} -MbrType 12')
@@ -568,10 +575,10 @@ def format_drive(letter, label='3DS', expect_size=None, log=print):
                         f'({cluster // 1024 if cluster else "?"} Ko). Retirez et réinsérez la carte.')
 
 
-def format_drive_elevated(letter, label, expect_size, log=print):
+def format_drive_elevated(letter, label, expect_size, max_bytes, log=print):
     """Lance le formatage dans un processus administrateur (invite UAC) et attend la fin."""
     if is_admin():
-        return format_drive(letter, label, expect_size, log)
+        return format_drive(letter, label, expect_size, max_bytes, log)
     if getattr(sys, 'frozen', False):
         raise SDFormatError('Relancez l’application en tant qu’administrateur pour formater.')
 
@@ -583,6 +590,7 @@ def format_drive_elevated(letter, label, expect_size, log=print):
     os.close(fd)
     params = subprocess.list2cmdline(['-m', 'custominstall.sdformat', 'format', '--drive', letter,
                                       '--label', label, '--expect-size', str(expect_size or 0),
+                                      '--max-bytes', str(max_bytes),
                                       '--result', result_path])
 
     class SHELLEXECUTEINFOW(ct.Structure):
@@ -631,16 +639,19 @@ def _cli(argv=None):
     import argparse
     parser = argparse.ArgumentParser(prog='python -m custominstall.sdformat')
     sub = parser.add_subparsers(dest='cmd', required=True)
-    sub.add_parser('list', help='liste les lecteurs et indique ceux qui sont exclus')
+    lst = sub.add_parser('list', help='liste les lecteurs et indique ceux qui sont exclus')
+    lst.add_argument('--max-bytes', type=int, default=0)
     fmt = sub.add_parser('format', help='formate une SD en FAT32 32 Ko (administrateur)')
     fmt.add_argument('--drive', required=True)
     fmt.add_argument('--label', default='3DS')
     fmt.add_argument('--expect-size', type=int, default=0)
+    fmt.add_argument('--max-bytes', type=int, default=0)
     fmt.add_argument('--result', help='fichier JSON où écrire le résultat')
     args = parser.parse_args(argv)
+    max_bytes = args.max_bytes or max_bytes_from_config(None)
 
     if args.cmd == 'list':
-        for d in list_drives(include_unsafe=True):
+        for d in list_drives(max_bytes, include_unsafe=True):
             print(f'{d.display():50} {"OK" if d.safe else "EXCLU : " + d.reason}')
         return 0
 
@@ -652,7 +663,7 @@ def _cli(argv=None):
 
     result = {'ok': False, 'log': lines}
     try:
-        result['ok'] = format_drive(args.drive, args.label, args.expect_size, log)
+        result['ok'] = format_drive(args.drive, args.label, args.expect_size, max_bytes, log)
     except SDFormatError as e:
         result['error'] = str(e)
     except Exception as e:  # remonté tel quel à l'interface

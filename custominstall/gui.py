@@ -6,7 +6,6 @@
 # This file is licensed under The MIT License (MIT).
 # You can find the full license text in LICENSE.md in the root of this project.
 
-import string
 import shutil
 import time
 from os import environ, makedirs, scandir, walk
@@ -100,70 +99,8 @@ statuses = {
 }
 
 
-def get_windows_drives():
-    if not is_windows:
-        return []
-    import ctypes as ct
-    drives = []
-    bitmask = ct.windll.kernel32.GetLogicalDrives()
-    for letter in string.ascii_uppercase:
-        if bitmask & 1:
-            drives.append(letter + ':')
-        bitmask >>= 1
-    return drives
-
-
-def get_windows_drives_info():
-    """Return drive list with volume name and size, e.g. ['E: — SanDisk (32 Go)', ...]."""
-    if not is_windows:
-        return []
-    import ctypes as ct
-    import ctypes.wintypes as wt
-    result = []
-    bitmask = ct.windll.kernel32.GetLogicalDrives()
-    for letter in string.ascii_uppercase:
-        if not (bitmask & 1):
-            bitmask >>= 1
-            continue
-        bitmask >>= 1
-        drive = letter + ':\\'
-        vol_name = ct.create_unicode_buffer(261)
-        try:
-            ct.windll.kernel32.GetVolumeInformationW(
-                drive, vol_name, 261, None, None, None, None, 0)
-        except Exception:
-            vol_name.value = ''
-        total = ct.c_ulonglong(0)
-        try:
-            ct.windll.kernel32.GetDiskFreeSpaceExW(drive, None, ct.byref(total), None)
-        except Exception:
-            pass
-        gb = total.value / (1024 ** 3)
-        if gb >= 1:
-            size_str = f'{gb:.0f} Go'
-        elif total.value > 0:
-            size_str = f'{total.value / (1024 ** 2):.0f} Mo'
-        else:
-            size_str = None
-        name = vol_name.value.strip()
-        if name and size_str:
-            label = f'{letter}: — {name} ({size_str})'
-        elif name:
-            label = f'{letter}: — {name}'
-        elif size_str:
-            label = f'{letter}: ({size_str})'
-        else:
-            label = f'{letter}:'
-        result.append(label)
-    return result
-
-
 _DRIVE_NONE = '(Aucun)'
-
-
-def _drive_combo_values():
-    """Returns [_DRIVE_NONE] + current drives list."""
-    return [_DRIVE_NONE] + get_windows_drives_info()
+DRIVE_LIMIT_EVENT = '<<DriveLimitChanged>>'  # émis quand la limite de taille est modifiée
 
 
 def _drive_to_path(value):
@@ -178,17 +115,17 @@ def _drive_to_path(value):
     return value
 
 
-def _sd_drive_combo_values():
-    """[_DRIVE_NONE] + lecteurs pouvant être une SD (C:, D:, disques système et > 1,1 To exclus).
-    Lent (~1 s, interroge Windows) : à appeler hors du thread de l'interface."""
-    return [_DRIVE_NONE] + [d.display() for d in sdformat.list_drives()]
+def _sd_drive_combo_values(config):
+    """[_DRIVE_NONE] + lecteurs proposés : tous sauf C:, D: et ceux au-delà de la limite de taille."""
+    max_bytes = sdformat.max_bytes_from_config(config)
+    return [_DRIVE_NONE] + [d.display() for d in sdformat.list_drives(max_bytes)]
 
 
-def _refresh_sd_combo_async(widget, combo, on_done=None):
-    """Recharge la liste des SD dans un thread puis met à jour le combo (garde la sélection)."""
+def _refresh_sd_combo_async(widget, combo, config, on_done=None):
+    """Recharge la liste des lecteurs dans un thread puis met à jour le combo (garde la sélection)."""
     def work():
         try:
-            values = _sd_drive_combo_values()
+            values = _sd_drive_combo_values(config)
         except Exception:
             values = [_DRIVE_NONE]
 
@@ -207,6 +144,15 @@ def _refresh_sd_combo_async(widget, combo, on_done=None):
         except RuntimeError:
             pass  # fenêtre fermée entre-temps
     Thread(target=work, daemon=True).start()
+
+
+def _setup_drive_combo(widget, combo, config, on_done=None):
+    """Remplit le combo au démarrage et à chaque changement de la limite de taille."""
+    refresh = lambda *_: _refresh_sd_combo_async(widget, combo, config, on_done)
+    # Différé : le thread ne doit rappeler l'interface qu'une fois la boucle Tk démarrée
+    widget.after(200, refresh)
+    widget.winfo_toplevel().bind(DRIVE_LIMIT_EVENT, refresh, add='+')
+    return refresh
 
 
 def _try_get_id0(movable_path):
@@ -455,17 +401,10 @@ class CustomInstallGUI(ttk.Frame):
         sd_inner.grid(row=0, column=1, sticky=tk.EW, padx=5, pady=(8, 3))
         sd_inner.columnconfigure(2, weight=1)
 
-        drives_info = _drive_combo_values()
-        self._sd_drive_combo = ttk.Combobox(sd_inner, values=drives_info, state='readonly', width=22)
+        self._sd_drive_combo = ttk.Combobox(sd_inner, values=[_DRIVE_NONE], state='readonly', width=30)
         self._sd_drive_combo.current(0)  # (Aucun) par défaut
         self._sd_drive_combo.grid(row=0, column=0, padx=(0, 3))
-
-        def refresh_sd_drives():
-            info = _drive_combo_values()
-            cur = self._sd_drive_combo.get()
-            self._sd_drive_combo.configure(values=info)
-            if cur in info:
-                self._sd_drive_combo.current(info.index(cur))
+        refresh_sd_drives = _setup_drive_combo(self, self._sd_drive_combo, self.config)
 
         ttk.Button(sd_inner, text='↻', width=3, command=refresh_sd_drives).grid(row=0, column=1, padx=(0, 6))
 
@@ -492,9 +431,8 @@ class CustomInstallGUI(ttk.Frame):
 
         def clear_sd():
             sd_selected.delete('1.0', tk.END)
-            drives = _drive_combo_values()
-            self._sd_drive_combo.configure(values=drives)
             self._sd_drive_combo.current(0)  # retour sur (Aucun)
+            refresh_sd_drives()
 
         ttk.Button(dest_frame, text='×', width=2, command=clear_sd).grid(row=0, column=3, padx=(0, 10), pady=(8, 3))
         self.file_picker_textboxes['sd'] = sd_selected
@@ -1170,16 +1108,10 @@ class NDSCopyFrame(ttk.Frame):
         _dc = ttk.Frame(dest_frame)
         _dc.grid(row=0, column=1, sticky=tk.W, padx=(0, 8), pady=5)
 
-        drives_info = _drive_combo_values()
-        self._drive_combo = ttk.Combobox(_dc, values=drives_info, state='readonly', width=30)
+        self._drive_combo = ttk.Combobox(_dc, values=[_DRIVE_NONE], state='readonly', width=40)
         self._drive_combo.current(0)  # (Aucun) par défaut
         self._drive_combo.grid(row=0, column=0, padx=(0, 3))
-
-        def _refresh_nds():
-            cur = self._drive_combo.get()
-            info = _drive_combo_values()
-            self._drive_combo.configure(values=info)
-            self._drive_combo.current(info.index(cur) if cur in info else 0)
+        _refresh_nds = _setup_drive_combo(self, self._drive_combo, config)
 
         ttk.Button(_dc, text='↻', width=3, command=_refresh_nds).grid(row=0, column=1)
 
@@ -1441,15 +1373,12 @@ class CustomPackFrame(ttk.Frame):
         _dc2 = ttk.Frame(dest_frame)
         _dc2.grid(row=0, column=1, sticky=tk.W, padx=(0, 8), pady=5)
 
-        # Seules les cartes SD possibles sont proposées (C:, D:, disques système et > 1,1 To exclus)
+        # C:, D: et les disques au-delà de la limite de taille (Paramètres) ne sont pas proposés
         self._drive_combo = ttk.Combobox(_dc2, values=[_DRIVE_NONE], state='readonly', width=40)
         self._drive_combo.current(0)  # (Aucun) par défaut
         self._drive_combo.grid(row=0, column=0, padx=(0, 3))
-
         ttk.Button(_dc2, text='↻', width=3,
-                   command=lambda: _refresh_sd_combo_async(self, self._drive_combo)).grid(row=0, column=1)
-        # Différé : le thread ne doit rappeler l'interface qu'une fois la boucle Tk démarrée
-        self.after(200, lambda: _refresh_sd_combo_async(self, self._drive_combo))
+                   command=_setup_drive_combo(self, self._drive_combo, config)).grid(row=0, column=1)
 
         # --- Packs ---
         packs_frame = ttk.LabelFrame(self, text='Packs à copier (le contenu sera copié à la racine de la SD)')
@@ -1708,7 +1637,7 @@ class CustomPackFrame(ttk.Frame):
         def check():
             # Hors du thread de l'interface : interroge Windows (lecteur autorisé ? format ?)
             try:
-                info = sdformat.get_safe_drive(target_path[0])
+                info = sdformat.get_safe_drive(target_path[0], sdformat.max_bytes_from_config(self.config))
             except sdformat.SDFormatError as e:
                 self.after(0, lambda m=str(e): self._abort(m, error=True))
                 return
@@ -1735,7 +1664,8 @@ class CustomPackFrame(ttk.Frame):
             self._log(f'Format de {drive} incorrect : {current} (attendu : FAT32, clusters de 32 Ko).')
             if not mb.askyesno(
                     'Format de la carte incorrect',
-                    f'La carte {drive} ({sdformat.human_size(info.size)}) est en {current}.\n'
+                    f'La carte {drive} ({sdformat.human_size(info.size)}) est en '
+                    f'{"format non reconnu" if info.raw else current}.\n'
                     'La 3DS a besoin de FAT32 avec des clusters de 32 Ko.\n\n'
                     f'Formater {drive} maintenant ?\n\n'
                     '⚠ TOUTES les données de la carte seront définitivement effacées.',
@@ -1773,16 +1703,17 @@ class CustomPackFrame(ttk.Frame):
                     clear = True
 
         label = sdformat.sanitize_label(info.label) or '3DS'
+        max_bytes = sdformat.max_bytes_from_config(self.config)
 
         def work():
             try:
                 if do_format:
                     self.after(0, lambda: self._progress_label.config(text='Formatage en cours...'))
-                    sdformat.format_drive_elevated(info.letter, label, info.size, log=self._log)
+                    sdformat.format_drive_elevated(info.letter, label, info.size, max_bytes, log=self._log)
                 elif clear:
                     self.after(0, lambda: self._progress_label.config(text='Suppression du contenu...'))
                     self._log(f'Suppression du contenu de {drive}...')
-                    n = sdformat.clear_drive_contents(info.root, log=self._log, cancelled=cancelled)
+                    n = sdformat.clear_drive_contents(info.root, max_bytes, log=self._log, cancelled=cancelled)
                     self._log(f'{n} élément(s) supprimé(s).')
             except (sdformat.SDFormatError, OSError) as e:
                 self.after(0, lambda m=str(e): self._abort(m, error=True))
@@ -1831,12 +1762,9 @@ class SDFormatFrame(ttk.Frame):
         self._status = ttk.Label(dest, text='', foreground='grey')
         self._status.grid(row=2, column=0, columnspan=2, sticky=tk.W, padx=8, pady=(0, 5))
 
-        ttk.Label(dest, foreground='grey', wraplength=560, justify=tk.LEFT,
-                  text='Format : FAT32 (y compris « Large FAT32 » au-delà de 32 Go), clusters de 32 Ko. '
-                       'Seuls les lecteurs USB / cartes SD de moins de 1,1 To sont proposés ; '
-                       'C:, D: et le disque système ne le sont jamais. '
-                       'Windows demandera les droits administrateur.').grid(
-            row=3, column=0, columnspan=2, sticky=tk.W, padx=8, pady=(0, 8))
+        self._note = ttk.Label(dest, foreground='grey', wraplength=560, justify=tk.LEFT)
+        self._note.grid(row=3, column=0, columnspan=2, sticky=tk.W, padx=8, pady=(0, 8))
+        self._update_note()
 
         prog = ttk.LabelFrame(self, text='Progression')
         prog.grid(row=2, column=0, sticky=tk.NSEW, padx=10, pady=(0, 10))
@@ -1855,6 +1783,7 @@ class SDFormatFrame(ttk.Frame):
 
         if is_windows:
             self.after(200, self._refresh)
+            self.winfo_toplevel().bind(DRIVE_LIMIT_EVENT, lambda e: (self._update_note(), self._refresh()), add='+')
         else:
             self._status.config(text='Formatage disponible uniquement sous Windows.')
             self._start_btn.config(state=tk.DISABLED)
@@ -1867,12 +1796,19 @@ class SDFormatFrame(ttk.Frame):
             self._log_text.configure(state=tk.DISABLED)
         self.after(0, _do)
 
+    def _update_note(self):
+        limit = sdformat.format_limit(sdformat.max_bytes_from_config(self.config))
+        self._note.config(text='Format : FAT32 (y compris « Large FAT32 » au-delà de 32 Go), clusters de 32 Ko. '
+                               f'C: et D: ne sont jamais proposés, ni les disques de plus de {limit} '
+                               '(limite réglable dans Paramètres). '
+                               'Windows demandera les droits administrateur.')
+
     def _refresh(self):
         self._status.config(text='Recherche des cartes SD...')
 
         def work():
             try:
-                drives = sdformat.list_drives()
+                drives = sdformat.list_drives(sdformat.max_bytes_from_config(self.config))
             except Exception:
                 drives = []
 
@@ -1899,7 +1835,9 @@ class SDFormatFrame(ttk.Frame):
                                 'Aucune carte SD détectée (insérez-la puis cliquez sur ↻).',
                                 foreground='grey')
             return
-        if info.fs.upper() == 'FAT32' and info.cluster == sdformat.CLUSTER_SIZE:
+        if info.raw:
+            self._status.config(text=f'{letter}: n’est pas formatée (format non reconnu).', foreground='grey')
+        elif info.fs.upper() == 'FAT32' and info.cluster == sdformat.CLUSTER_SIZE:
             self._status.config(text=f'{letter}: est déjà en FAT32, clusters de 32 Ko.', foreground='green')
         else:
             cl = f', clusters de {info.cluster // 1024} Ko' if info.cluster else ''
@@ -1927,7 +1865,7 @@ class SDFormatFrame(ttk.Frame):
         def check():
             # Re-vérifie le lecteur au moment du clic (la carte a pu être changée)
             try:
-                info = sdformat.get_safe_drive(letter)
+                info = sdformat.get_safe_drive(letter, sdformat.max_bytes_from_config(self.config))
             except sdformat.SDFormatError as e:
                 self.after(0, lambda m=str(e): done(m, error=True))
                 return
@@ -1941,7 +1879,7 @@ class SDFormatFrame(ttk.Frame):
                     f'Lecteur : {info.letter}:\n'
                     f'Nom actuel : {info.label or "(sans nom)"}\n'
                     f'Taille : {sdformat.human_size(info.size)}\n'
-                    f'Format actuel : {info.fs or "?"}{cl}\n\n'
+                    f'Format actuel : {"non reconnu" if info.raw else (info.fs or "?") + cl}\n\n'
                     f'Nouveau format : FAT32, clusters de 32 Ko, nom « {label} »\n\n'
                     f'Formater {info.letter}: ?',
                     icon=mb.WARNING, default=mb.NO, parent=self):
@@ -1950,7 +1888,8 @@ class SDFormatFrame(ttk.Frame):
 
             def work():
                 try:
-                    sdformat.format_drive_elevated(info.letter, label, info.size, log=self._log)
+                    sdformat.format_drive_elevated(info.letter, label, info.size,
+                                                   sdformat.max_bytes_from_config(self.config), log=self._log)
                 except sdformat.SDFormatError as e:
                     self._log(f'Erreur : {e}')
                     self.after(0, lambda m=str(e): done(m, error=True))
@@ -2079,6 +2018,20 @@ class SettingsFrame(ttk.Frame):
             ttk.Button(parent, text='×', width=2,
                        command=lambda: var.set('')).grid(
                 row=pr, column=pc + 2, padx=(0, 8), pady=3)
+
+        # ---- Section Lecteurs ----
+        drv_sec = ttk.LabelFrame(body, text='Lecteurs (cartes SD)')
+        drv_sec.grid(row=next_row(), column=0, sticky=tk.EW, padx=10, pady=(10, 5))
+        ttk.Label(drv_sec, text='Taille maximale des disques proposés :').grid(
+            row=0, column=0, sticky=tk.W, padx=10, pady=(8, 3))
+        limit_gb = sdformat.max_bytes_from_config(config) / 1000 ** 3
+        self._max_size_var = tk.StringVar(value=f'{limit_gb:g}')
+        ttk.Entry(drv_sec, textvariable=self._max_size_var, width=8).grid(row=0, column=1, sticky=tk.W, pady=(8, 3))
+        ttk.Label(drv_sec, text='Go').grid(row=0, column=2, sticky=tk.W, padx=(4, 10), pady=(8, 3))
+        ttk.Label(drv_sec, foreground='grey',
+                  text='Les disques plus grands ne sont proposés dans aucun onglet (1100 Go = 1,1 To). '
+                       'C: et D: ne sont jamais proposés.').grid(
+            row=1, column=0, columnspan=3, sticky=tk.W, padx=10, pady=(0, 8))
 
         # ---- Section Dossiers source ----
         src_sec = ttk.LabelFrame(body, text='Dossiers source')
@@ -2284,6 +2237,17 @@ class SettingsFrame(ttk.Frame):
         self.after(3000, lambda: self._status.config(text=''))
 
     def _save(self):
+        raw_limit = self._max_size_var.get().strip().replace(',', '.')
+        try:
+            limit_gb = float(raw_limit)
+            if limit_gb <= 0:
+                raise ValueError
+        except ValueError:
+            mb.showerror('Paramètres', 'La taille maximale des disques doit être un nombre de Go positif '
+                                       '(ex. 1100).', parent=self)
+            return
+        limit_changed = limit_gb != sdformat.max_bytes_from_config(self.config) / 1000 ** 3
+        self.config['max_drive_size_gb'] = limit_gb
         self.config['source_root'] = self._source_var.get().strip()
         self.config['nds_source_root'] = self._nds_source_var.get().strip()
         for pack_name, pack_vars in self._nds_pack_vars.items():
@@ -2301,6 +2265,9 @@ class SettingsFrame(ttk.Frame):
         save_config(self.config)
         self._status.config(text='Enregistré.')
         self.after(3000, lambda: self._status.config(text=''))
+        if limit_changed:
+            # Recharge la liste des lecteurs dans tous les onglets
+            self.winfo_toplevel().event_generate(DRIVE_LIMIT_EVENT)
 
 
 def main():

@@ -3,6 +3,9 @@
   "_comment2": "Les valeurs ici sont des DÉFAUTS. Si l'utilisateur change quelque chose via Paramètres, ça prend la priorité.",
   "_comment3": "Pour réinitialiser les préférences, supprimez config.json (à côté de run_gui.bat).",
 
+  "_section_drives": "--- Lecteurs : les disques plus grands (en Go) ne sont jamais proposés. C: et D: sont toujours exclus ---",
+  "max_drive_size_gb": 1100,
+
   "_section_general": "--- Dossier source commun (racine contenant tous les packs) ---",
   "source_root": "",
 
