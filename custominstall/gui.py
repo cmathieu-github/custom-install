@@ -32,6 +32,7 @@ from . import __version__
 from .__main__ import CustomInstall, load_cifinish, InvalidCIFinishError, InstallStatus, save3ds_fuse_path
 from .config import load_config, save_config, load_profiles, save_profiles
 from .ndscopy import NDSCopier
+from . import sdformat
 
 if TYPE_CHECKING:
     from os import PathLike
@@ -175,6 +176,37 @@ def _drive_to_path(value):
         if not rest or rest[0] in (' ', '—', '—'):
             return value[0].upper() + ':\\'
     return value
+
+
+def _sd_drive_combo_values():
+    """[_DRIVE_NONE] + lecteurs pouvant être une SD (C:, D:, disques système et > 1,1 To exclus).
+    Lent (~1 s, interroge Windows) : à appeler hors du thread de l'interface."""
+    return [_DRIVE_NONE] + [d.display() for d in sdformat.list_drives()]
+
+
+def _refresh_sd_combo_async(widget, combo, on_done=None):
+    """Recharge la liste des SD dans un thread puis met à jour le combo (garde la sélection)."""
+    def work():
+        try:
+            values = _sd_drive_combo_values()
+        except Exception:
+            values = [_DRIVE_NONE]
+
+        def apply():
+            cur_letter = _drive_to_path(combo.get())[:1]
+            combo.configure(values=values)
+            idx = 0
+            for i, v in enumerate(values):
+                if cur_letter and _drive_to_path(v)[:1] == cur_letter:
+                    idx = i
+            combo.current(idx)
+            if on_done:
+                on_done()
+        try:
+            widget.after(0, apply)
+        except RuntimeError:
+            pass  # fenêtre fermée entre-temps
+    Thread(target=work, daemon=True).start()
 
 
 def _try_get_id0(movable_path):
@@ -443,6 +475,8 @@ class CustomInstallGUI(ttk.Frame):
         def on_sd_drive_selected(event):
             path = _drive_to_path(self._sd_drive_combo.get())
             sd_selected.delete('1.0', tk.END)
+            if not path:
+                return
             sd_selected.insert(tk.END, path)
             for filename in ['boot9.bin', 'seeddb.bin', 'movable.sed']:
                 p = auto_input_filename(self, path, filename)
@@ -570,7 +604,7 @@ class CustomInstallGUI(ttk.Frame):
                     if f.name.lower().endswith('.cia'):
                         success, reason = self.add_cia(f.path)
                         if not success:
-                            results[f] = reason
+                            results[f.path] = reason
                 if results:
                     TitleReadFailResults(self.parent, failed=results).focus()
                 self.sort_treeview()
@@ -1012,17 +1046,14 @@ class CustomInstallGUI(ttk.Frame):
             self.show_error('There are no titles added to install.')
             return
 
-        for path in self.readers.keys():
-            self.update_status(path, InstallStatus.Waiting)
-        self.disable_buttons()
-
-        if taskbar:
-            taskbar.SetProgressState(self.hwnd, tbl.TBPF_NORMAL)
-
-        installer = CustomInstall(movable=movable_sed,
-                                  sd=sd_root,
-                                  skip_contents=self.skip_contents_var.get() == 1,
-                                  overwrite_saves=self.overwrite_saves_var.get() == 1)
+        try:
+            installer = CustomInstall(movable=movable_sed,
+                                      sd=sd_root,
+                                      skip_contents=self.skip_contents_var.get() == 1,
+                                      overwrite_saves=self.overwrite_saves_var.get() == 1)
+        except Exception as e:
+            self.show_error(f'Impossible de préparer l\'installation :\n{type(e).__name__}: {e}')
+            return
 
         if not installer.check_for_id0():
             self.show_error(f'id0 {installer.crypto.id0.hex()} was not found inside "Nintendo 3DS" on the SD card.\n'
@@ -1031,6 +1062,13 @@ class CustomInstallGUI(ttk.Frame):
                             f'\n'
                             f'Otherwise, make sure the correct movable.sed is being used.')
             return
+
+        for path in self.readers.keys():
+            self.update_status(path, InstallStatus.Waiting)
+        self.disable_buttons()
+
+        if taskbar:
+            taskbar.SetProgressState(self.hwnd, tbl.TBPF_NORMAL)
 
         self.log('Starting install...')
 
@@ -1287,6 +1325,12 @@ class NDSCopyFrame(ttk.Frame):
         config_snap = self.config  # snapshot pour le thread
 
         def do_copy():
+            try:
+                _do_copy()
+            except Exception as e:
+                self._on_error(f'Copie interrompue : {type(e).__name__}: {e}')
+
+        def _do_copy():
             # Récapitulatif du mode additif (affiché avant tout pour éviter la confusion)
             if len(packs_to_copy) > 1:
                 self._log(
@@ -1397,18 +1441,15 @@ class CustomPackFrame(ttk.Frame):
         _dc2 = ttk.Frame(dest_frame)
         _dc2.grid(row=0, column=1, sticky=tk.W, padx=(0, 8), pady=5)
 
-        drives_info = _drive_combo_values()
-        self._drive_combo = ttk.Combobox(_dc2, values=drives_info, state='readonly', width=30)
+        # Seules les cartes SD possibles sont proposées (C:, D:, disques système et > 1,1 To exclus)
+        self._drive_combo = ttk.Combobox(_dc2, values=[_DRIVE_NONE], state='readonly', width=40)
         self._drive_combo.current(0)  # (Aucun) par défaut
         self._drive_combo.grid(row=0, column=0, padx=(0, 3))
 
-        def _refresh_cp():
-            cur = self._drive_combo.get()
-            info = _drive_combo_values()
-            self._drive_combo.configure(values=info)
-            self._drive_combo.current(info.index(cur) if cur in info else 0)
-
-        ttk.Button(_dc2, text='↻', width=3, command=_refresh_cp).grid(row=0, column=1)
+        ttk.Button(_dc2, text='↻', width=3,
+                   command=lambda: _refresh_sd_combo_async(self, self._drive_combo)).grid(row=0, column=1)
+        # Différé : le thread ne doit rappeler l'interface qu'une fois la boucle Tk démarrée
+        self.after(200, lambda: _refresh_sd_combo_async(self, self._drive_combo))
 
         # --- Packs ---
         packs_frame = ttk.LabelFrame(self, text='Packs à copier (le contenu sera copié à la racine de la SD)')
@@ -1563,6 +1604,12 @@ class CustomPackFrame(ttk.Frame):
                     ))
 
     def _run_copy(self, sources, target_path, cancelled):
+        try:
+            self._run_copy_inner(sources, target_path, cancelled)
+        except Exception as e:
+            self.after(0, lambda m=f'Copie interrompue : {type(e).__name__}: {e}': self._abort(m, error=True))
+
+    def _run_copy_inner(self, sources, target_path, cancelled):
         total = 0
         for src in sources:
             if isdir(src):
@@ -1623,18 +1670,23 @@ class CustomPackFrame(ttk.Frame):
         ))
 
     def _start(self):
-        dest = self._drive_combo.get().strip()
-        if not dest:
+        target_path = _drive_to_path(self._drive_combo.get()) if is_windows else self._drive_combo.get().strip()
+        if not target_path:
             mb.showerror('Erreur', 'Veuillez sélectionner un lecteur.', parent=self)
             return
 
-        target_path = _drive_to_path(dest) if is_windows else dest
-
-        sources = [pv.get().strip() for ev, pv in self._pack_entries
+        sources = [pv.get().strip() for ev, nv, pv in self._pack_entries
                    if ev.get() and pv.get().strip()]
         if not sources:
             mb.showerror('Erreur', 'Aucun pack activé ou configuré.', parent=self)
             return
+
+        if is_windows:
+            same_drive = [src for src in sources if abspath(src)[:1].upper() == target_path[:1].upper()]
+            if same_drive:
+                mb.showerror('Erreur', 'Un pack source se trouve sur le lecteur de destination :\n'
+                             f'{same_drive[0]}', parent=self)
+                return
 
         self._save_paths()
 
@@ -1643,18 +1695,274 @@ class CustomPackFrame(ttk.Frame):
         self._log_text.delete('1.0', tk.END)
         self._log_text.configure(state=tk.DISABLED)
         self._progress_var.set(0)
-        self._progress_label.config(text='Calcul de la taille...')
+        self._progress_label.config(text='Vérification de la carte SD...')
         self._file_label.config(text='')
         self._start_btn.config(state=tk.DISABLED)
         self._cancel_btn.config(state=tk.NORMAL)
 
         cancelled = self._cancelled
-        Thread(target=lambda: self._run_copy(sources, target_path, cancelled), daemon=True).start()
+        if not is_windows:
+            Thread(target=lambda: self._run_copy(sources, target_path, cancelled), daemon=True).start()
+            return
+
+        def check():
+            # Hors du thread de l'interface : interroge Windows (lecteur autorisé ? format ?)
+            try:
+                info = sdformat.get_safe_drive(target_path[0])
+            except sdformat.SDFormatError as e:
+                self.after(0, lambda m=str(e): self._abort(m, error=True))
+                return
+            ok, fs, cluster = sdformat.check_sd_format(info.letter)
+            self.after(0, lambda: self._ask_prepare(info, ok, fs, cluster, sources, cancelled))
+
+        Thread(target=check, daemon=True).start()
+
+    def _abort(self, message, error=False):
+        self._log(message)
+        if error:
+            mb.showerror('Erreur', message, parent=self)
+        self._progress_label.config(text='Annulé.')
+        self._start_btn.config(state=tk.NORMAL)
+        self._cancel_btn.config(state=tk.DISABLED)
+
+    def _ask_prepare(self, info, format_ok, fs, cluster, sources, cancelled):
+        drive = f'{info.letter}:'
+        clear = False
+        do_format = False
+
+        if not format_ok:
+            current = f'{fs or "illisible"}' + (f', clusters de {cluster // 1024} Ko' if cluster else '')
+            self._log(f'Format de {drive} incorrect : {current} (attendu : FAT32, clusters de 32 Ko).')
+            if not mb.askyesno(
+                    'Format de la carte incorrect',
+                    f'La carte {drive} ({sdformat.human_size(info.size)}) est en {current}.\n'
+                    'La 3DS a besoin de FAT32 avec des clusters de 32 Ko.\n\n'
+                    f'Formater {drive} maintenant ?\n\n'
+                    '⚠ TOUTES les données de la carte seront définitivement effacées.',
+                    icon=mb.WARNING, default=mb.NO, parent=self):
+                self._abort('Copie annulée : la carte n’est pas au bon format.')
+                return
+            do_format = True
+        else:
+            try:
+                entries = sorted(e.name for e in scandir(info.root)
+                                 if e.name.lower() not in sdformat.KEEP_ON_CLEAR)
+            except OSError:
+                entries = []
+            if entries:
+                preview = '\n'.join(f'  • {n}' for n in entries[:8])
+                if len(entries) > 8:
+                    preview += f'\n  … et {len(entries) - 8} autre(s)'
+                answer = mb.askyesnocancel(
+                    'Contenu existant sur la carte',
+                    f'La carte {drive} contient déjà {len(entries)} élément(s) :\n{preview}\n\n'
+                    'Supprimer ce contenu avant de copier le nouveau pack ?\n\n'
+                    'Oui : tout supprimer (y compris « Nintendo 3DS » s’il est présent)\n'
+                    'Non : conserver et écraser les fichiers existants\n'
+                    'Annuler : ne rien faire',
+                    icon=mb.WARNING, default=mb.NO, parent=self)
+                if answer is None:
+                    self._abort('Copie annulée.')
+                    return
+                if answer:
+                    if not mb.askokcancel('Confirmer la suppression',
+                                          f'Supprimer définitivement le contenu de {drive} ?',
+                                          icon=mb.WARNING, default=mb.CANCEL, parent=self):
+                        self._abort('Copie annulée.')
+                        return
+                    clear = True
+
+        label = sdformat.sanitize_label(info.label) or '3DS'
+
+        def work():
+            try:
+                if do_format:
+                    self.after(0, lambda: self._progress_label.config(text='Formatage en cours...'))
+                    sdformat.format_drive_elevated(info.letter, label, info.size, log=self._log)
+                elif clear:
+                    self.after(0, lambda: self._progress_label.config(text='Suppression du contenu...'))
+                    self._log(f'Suppression du contenu de {drive}...')
+                    n = sdformat.clear_drive_contents(info.root, log=self._log, cancelled=cancelled)
+                    self._log(f'{n} élément(s) supprimé(s).')
+            except (sdformat.SDFormatError, OSError) as e:
+                self.after(0, lambda m=str(e): self._abort(m, error=True))
+                return
+            if cancelled[0]:
+                self.after(0, lambda: self._abort('Copie annulée.'))
+                return
+            self.after(0, lambda: self._progress_label.config(text='Calcul de la taille...'))
+            self._run_copy(sources, info.root, cancelled)
+
+        Thread(target=work, daemon=True).start()
 
     def _cancel(self):
         self._cancelled[0] = True
         self._cancel_btn.config(state=tk.DISABLED)
         self._log('Annulation en cours...')
+
+
+class SDFormatFrame(ttk.Frame):
+    """Onglet de formatage d'une carte SD en FAT32, clusters de 32 Ko."""
+
+    def __init__(self, parent, config):
+        super().__init__(parent)
+        self.config = config
+        self._drives = {}
+        self.columnconfigure(0, weight=1)
+        self.rowconfigure(2, weight=1)
+
+        dest = ttk.LabelFrame(self, text='Carte SD à formater')
+        dest.grid(row=0, column=0, sticky=tk.EW, padx=10, pady=10)
+        dest.columnconfigure(1, weight=1)
+
+        ttk.Label(dest, text='Lecteur :').grid(row=0, column=0, sticky=tk.W, padx=(8, 4), pady=5)
+        dc = ttk.Frame(dest)
+        dc.grid(row=0, column=1, sticky=tk.W, pady=5)
+        self._drive_combo = ttk.Combobox(dc, values=[_DRIVE_NONE], state='readonly', width=40)
+        self._drive_combo.current(0)
+        self._drive_combo.grid(row=0, column=0, padx=(0, 3))
+        self._drive_combo.bind('<<ComboboxSelected>>', lambda e: self._update_status())
+        ttk.Button(dc, text='↻', width=3, command=self._refresh).grid(row=0, column=1)
+
+        ttk.Label(dest, text='Nom du volume :').grid(row=1, column=0, sticky=tk.W, padx=(8, 4), pady=5)
+        self._label_var = tk.StringVar(value='3DS')
+        ttk.Entry(dest, textvariable=self._label_var, width=16).grid(row=1, column=1, sticky=tk.W, pady=5)
+
+        self._status = ttk.Label(dest, text='', foreground='grey')
+        self._status.grid(row=2, column=0, columnspan=2, sticky=tk.W, padx=8, pady=(0, 5))
+
+        ttk.Label(dest, foreground='grey', wraplength=560, justify=tk.LEFT,
+                  text='Format : FAT32 (y compris « Large FAT32 » au-delà de 32 Go), clusters de 32 Ko. '
+                       'Seuls les lecteurs USB / cartes SD de moins de 1,1 To sont proposés ; '
+                       'C:, D: et le disque système ne le sont jamais. '
+                       'Windows demandera les droits administrateur.').grid(
+            row=3, column=0, columnspan=2, sticky=tk.W, padx=8, pady=(0, 8))
+
+        prog = ttk.LabelFrame(self, text='Progression')
+        prog.grid(row=2, column=0, sticky=tk.NSEW, padx=10, pady=(0, 10))
+        prog.columnconfigure(0, weight=1)
+        prog.rowconfigure(1, weight=1)
+        self._progress = ttk.Progressbar(prog, mode='indeterminate')
+        self._progress.grid(row=0, column=0, columnspan=2, sticky=tk.EW, padx=10, pady=(5, 0))
+        scroll = ttk.Scrollbar(prog, orient=tk.VERTICAL)
+        scroll.grid(row=1, column=1, sticky=tk.NS)
+        self._log_text = tk.Text(prog, height=8, state=tk.DISABLED, wrap='word', yscrollcommand=scroll.set)
+        self._log_text.grid(row=1, column=0, sticky=tk.NSEW, padx=(10, 0), pady=5)
+        scroll.config(command=self._log_text.yview)
+
+        self._start_btn = ttk.Button(self, text='Formater en FAT32 (32 Ko)', command=self._start)
+        self._start_btn.grid(row=3, column=0, pady=10)
+
+        if is_windows:
+            self.after(200, self._refresh)
+        else:
+            self._status.config(text='Formatage disponible uniquement sous Windows.')
+            self._start_btn.config(state=tk.DISABLED)
+
+    def _log(self, message):
+        def _do():
+            self._log_text.configure(state=tk.NORMAL)
+            self._log_text.insert(tk.END, message + '\n')
+            self._log_text.see(tk.END)
+            self._log_text.configure(state=tk.DISABLED)
+        self.after(0, _do)
+
+    def _refresh(self):
+        self._status.config(text='Recherche des cartes SD...')
+
+        def work():
+            try:
+                drives = sdformat.list_drives()
+            except Exception:
+                drives = []
+
+            def apply():
+                self._drives = {d.letter: d for d in drives}
+                values = [_DRIVE_NONE] + [d.display() for d in drives]
+                cur = _drive_to_path(self._drive_combo.get())[:1]
+                self._drive_combo.configure(values=values)
+                idx = next((i for i, v in enumerate(values) if cur and _drive_to_path(v)[:1] == cur), 0)
+                self._drive_combo.current(idx)
+                self._update_status()
+            try:
+                self.after(0, apply)
+            except RuntimeError:
+                pass  # fenêtre fermée entre-temps
+        Thread(target=work, daemon=True).start()
+
+    def _update_status(self):
+        letter = _drive_to_path(self._drive_combo.get())[:1]
+        info = self._drives.get(letter)
+        if not info:
+            count = len(self._drives)
+            self._status.config(text=f'{count} carte(s) SD détectée(s).' if count else
+                                'Aucune carte SD détectée (insérez-la puis cliquez sur ↻).',
+                                foreground='grey')
+            return
+        if info.fs.upper() == 'FAT32' and info.cluster == sdformat.CLUSTER_SIZE:
+            self._status.config(text=f'{letter}: est déjà en FAT32, clusters de 32 Ko.', foreground='green')
+        else:
+            cl = f', clusters de {info.cluster // 1024} Ko' if info.cluster else ''
+            self._status.config(text=f'Format actuel : {info.fs or "?"}{cl}', foreground='grey')
+        if info.label:
+            self._label_var.set(sdformat.sanitize_label(info.label) or '3DS')
+
+    def _start(self):
+        letter = _drive_to_path(self._drive_combo.get())[:1]
+        if not letter:
+            mb.showerror('Erreur', 'Veuillez sélectionner une carte SD.', parent=self)
+            return
+        label = sdformat.sanitize_label(self._label_var.get()) or '3DS'
+        self._label_var.set(label)
+        self._start_btn.config(state=tk.DISABLED)
+        self._progress.start(15)
+
+        def done(message=None, error=False):
+            self._progress.stop()
+            self._start_btn.config(state=tk.NORMAL)
+            if message:
+                (mb.showerror if error else mb.showinfo)('Formatage', message, parent=self)
+            self._refresh()
+
+        def check():
+            # Re-vérifie le lecteur au moment du clic (la carte a pu être changée)
+            try:
+                info = sdformat.get_safe_drive(letter)
+            except sdformat.SDFormatError as e:
+                self.after(0, lambda m=str(e): done(m, error=True))
+                return
+            self.after(0, lambda: confirm(info))
+
+        def confirm(info):
+            cl = f' ({info.cluster // 1024} Ko)' if info.cluster else ''
+            if not mb.askyesno(
+                    'Confirmer le formatage',
+                    '⚠ TOUTES les données de la carte vont être définitivement effacées.\n\n'
+                    f'Lecteur : {info.letter}:\n'
+                    f'Nom actuel : {info.label or "(sans nom)"}\n'
+                    f'Taille : {sdformat.human_size(info.size)}\n'
+                    f'Format actuel : {info.fs or "?"}{cl}\n\n'
+                    f'Nouveau format : FAT32, clusters de 32 Ko, nom « {label} »\n\n'
+                    f'Formater {info.letter}: ?',
+                    icon=mb.WARNING, default=mb.NO, parent=self):
+                done()
+                return
+
+            def work():
+                try:
+                    sdformat.format_drive_elevated(info.letter, label, info.size, log=self._log)
+                except sdformat.SDFormatError as e:
+                    self._log(f'Erreur : {e}')
+                    self.after(0, lambda m=str(e): done(m, error=True))
+                    return
+                except Exception as e:
+                    self._log(f'Erreur : {e}')
+                    self.after(0, lambda m=f'{type(e).__name__} : {e}': done(m, error=True))
+                    return
+                self.after(0, lambda: done(f'{info.letter}: est formatée en FAT32 (clusters de 32 Ko).'))
+            Thread(target=work, daemon=True).start()
+
+        Thread(target=check, daemon=True).start()
 
 
 class SettingsFrame(ttk.Frame):
@@ -1697,8 +2005,12 @@ class SettingsFrame(ttk.Frame):
 
         body.bind('<Configure>', lambda e: canvas.configure(scrollregion=canvas.bbox('all')))
         canvas.bind('<Configure>', lambda e: canvas.itemconfig(cw, width=e.width))
-        canvas.bind_all('<MouseWheel>',
-                        lambda e: canvas.yview_scroll(int(-1 * (e.delta / 120)), 'units'))
+        def _wheel(e):
+            if canvas.yview() != (0.0, 1.0):  # rien à faire défiler si tout est visible
+                canvas.yview_scroll(int(-1 * (e.delta / 120)), 'units')
+        # Molette active uniquement quand la souris est au-dessus de la page Paramètres
+        canvas.bind('<Enter>', lambda e: canvas.bind_all('<MouseWheel>', _wheel))
+        canvas.bind('<Leave>', lambda e: canvas.unbind_all('<MouseWheel>'))
 
         _row = [0]  # mutable counter
 
@@ -1995,7 +2307,7 @@ def main():
     config = load_config()
 
     window = tk.Tk()
-    window.title('3DS Hack Custom CnC v1')
+    window.title('3DS Hack Manager - ISA')
 
     if not (save3ds_fuse_path and isfile(save3ds_fuse_path)):
         mb.showwarning('Avertissement',
@@ -2013,6 +2325,9 @@ def main():
 
     custom_tab = CustomPackFrame(notebook, config)
     notebook.add(custom_tab, text='Packs Customs')
+
+    format_tab = SDFormatFrame(notebook, config)
+    notebook.add(format_tab, text='Formater SD')
 
     settings_tab = SettingsFrame(notebook, config)
     notebook.add(settings_tab, text='Paramètres')

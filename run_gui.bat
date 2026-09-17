@@ -1,4 +1,5 @@
 @echo off
+title 3DS Hack Manager - ISA
 cd /d "%~dp0"
 
 where python >nul 2>&1

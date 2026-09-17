@@ -1,7 +1,7 @@
 {
   "_comment": "Fichier de paramètres par défaut. Modifiez ce fichier pour préconfigurer l'application.",
   "_comment2": "Les valeurs ici sont des DÉFAUTS. Si l'utilisateur change quelque chose via Paramètres, ça prend la priorité.",
-  "_comment3": "Pour réinitialiser les préférences utilisateur, supprimez : %USERPROFILE%\\.custominstall_config.json",
+  "_comment3": "Pour réinitialiser les préférences, supprimez config.json (à côté de run_gui.bat).",
 
   "_section_general": "--- Dossier source commun (racine contenant tous les packs) ---",
   "source_root": "",
