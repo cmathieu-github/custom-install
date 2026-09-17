@@ -25,3 +25,5 @@ venv/
 
 result
 result-*
+
+freeze_report.txt

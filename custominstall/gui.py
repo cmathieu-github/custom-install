@@ -11,7 +11,10 @@ import time
 from os import environ, makedirs, scandir, walk
 from os.path import abspath, basename, dirname, getsize, isdir, join, isfile, relpath
 import sys
-from threading import Thread, Lock
+from threading import Thread, Lock, main_thread
+import queue
+import threading
+import traceback
 from time import strftime
 from traceback import format_exception
 import tkinter as tk
@@ -99,6 +102,75 @@ statuses = {
 }
 
 
+# Tkinter n'est pas thread-safe : les threads de copie / installation ne touchent jamais l'interface
+# directement. Ils déposent des fonctions dans cette file, exécutées par la boucle de l'interface.
+_UI_QUEUE = queue.Queue()
+
+
+def ui_call(func):
+    """Planifie func sur le thread de l'interface (utilisable depuis n'importe quel thread)."""
+    _UI_QUEUE.put(func)
+
+
+def _start_ui_pump(widget):
+    top = widget.winfo_toplevel()
+    if getattr(top, '_ui_pump_started', False):
+        return
+    top._ui_pump_started = True
+
+    def pump():
+        deadline = time.monotonic() + 0.05  # garde l'interface fluide même si la file est pleine
+        while time.monotonic() < deadline:
+            try:
+                func = _UI_QUEUE.get_nowait()
+            except queue.Empty:
+                break
+            try:
+                func()
+            except Exception:
+                top.report_callback_exception(*sys.exc_info())
+        top.after(20, pump)
+    top.after(20, pump)
+
+
+FREEZE_REPORT_PATH = join(dirname(dirname(abspath(__file__))), 'freeze_report.txt')
+
+
+def _start_freeze_watchdog(window, threshold=8.0):
+    """Si l'interface ne répond plus pendant `threshold` secondes, écrit la pile de chaque thread
+    dans freeze_report.txt (à côté de run_gui.bat) pour identifier la cause."""
+    beat = [time.monotonic()]
+
+    def tick():
+        beat[0] = time.monotonic()
+        window.after(250, tick)
+    window.after(250, tick)
+
+    def watch():
+        reported = False
+        while True:
+            time.sleep(1)
+            gap = time.monotonic() - beat[0]
+            if gap >= threshold and not reported:
+                reported = True
+                frames = sys._current_frames()
+                lines = [f'=== Interface figée depuis {gap:.0f} s — {strftime("%Y-%m-%d %H:%M:%S")} ===']
+                for th in threading.enumerate():
+                    frame = frames.get(th.ident)
+                    if frame is None:
+                        continue
+                    lines.append(f'--- Thread « {th.name} »')
+                    lines.append(''.join(traceback.format_stack(frame)))
+                try:
+                    with open(FREEZE_REPORT_PATH, 'a', encoding='utf-8') as f:
+                        f.write('\n'.join(lines) + '\n\n')
+                except OSError:
+                    pass
+            elif gap < 2:
+                reported = False
+    Thread(target=watch, daemon=True, name='surveillance-interface').start()
+
+
 _DRIVE_NONE = '(Aucun)'
 DRIVES_CHANGED_EVENT = '<<DrivesChanged>>'  # recharge les listes de lecteurs de tous les onglets
 _BUSY_PROVIDERS = []  # fonctions renvoyant la racine du lecteur utilisé par une opération en cours
@@ -140,10 +212,7 @@ def _refresh_sd_combo_async(widget, combo, config, on_done=None):
             combo.current(idx)
             if on_done:
                 on_done()
-        try:
-            widget.after(0, apply)
-        except RuntimeError:
-            pass  # fenêtre fermée entre-temps
+        ui_call(apply)
     Thread(target=work, daemon=True).start()
 
 
@@ -191,10 +260,7 @@ def _eject_from_combo(widget, combo, config, on_ejected=None):
                     on_ejected(letter)
                 mb.showinfo('Éjecter', f'La carte {letter}: peut être retirée en toute sécurité.', parent=widget)
             top.event_generate(DRIVES_CHANGED_EVENT)
-        try:
-            widget.after(0, done)
-        except RuntimeError:
-            pass
+        ui_call(done)
     Thread(target=work, daemon=True).start()
 
 
@@ -401,6 +467,8 @@ class CustomInstallGUI(ttk.Frame):
 
         self.readers = {}
         self._installing_root = None
+        _start_ui_pump(self)
+
         _BUSY_PROVIDERS.append(lambda: self._installing_root)
         self.lock = Lock()
         self.log_messages = []
@@ -797,28 +865,32 @@ class CustomInstallGUI(ttk.Frame):
             self.console.pack(fill=tk.BOTH, expand=True)
 
             def close():
-                with self.lock:
-                    try:
-                        console_window.destroy()
-                    except:
-                        pass
-                    self.console = None
+                self.console = None
+                try:
+                    console_window.destroy()
+                except tk.TclError:
+                    pass
 
             console_window.focus()
 
             console_window.protocol('WM_DELETE_WINDOW', close)
 
     def log(self, line, status=True):
+        log_msg = f"{strftime('%H:%M:%S')} - {line}"
         with self.lock:
-            log_msg = f"{strftime('%H:%M:%S')} - {line}"
             self.log_messages.append(log_msg)
+        print(log_msg)
+
+        # Le verrou n'est jamais tenu pendant un appel à l'interface (sinon blocage mutuel possible)
+        def _ui():
             if self.console:
                 self.console.log(log_msg)
-
             if status:
                 self.status_label.config(text=line)
-
-            print(log_msg)
+        if threading.current_thread() is main_thread():
+            _ui()
+        else:
+            ui_call(_ui)
 
     def show_error(self, message):
         mb.showerror('Error', message, parent=self.parent)
@@ -909,7 +981,7 @@ class CustomInstallGUI(ttk.Frame):
                     self._id0_label.config(text=id0, foreground='#005500')
                 else:
                     self._id0_label.config(text='(impossible de lire le movable.sed)', foreground='red')
-            self.after(0, _set)
+            ui_call(_set)
         Thread(target=_do, daemon=True).start()
 
     def _update_nds_label(self):
@@ -917,7 +989,7 @@ class CustomInstallGUI(ttk.Frame):
         nds_size = self.config.get('cia_to_nds', {}).get(cia_size, '?')
         self._nds_auto_label.config(text=f'→ Pack NDS : {nds_size}')
 
-    def _run_nds_copy(self, target_path):
+    def _run_nds_copy(self, target_path, cia_size, language):
         """Copie les jeux NDS vers target_path (appelé depuis le thread d'installation)."""
         source_root = (self.config.get('nds_source_root', '').strip()
                        or self.config.get('source_root', '').strip())
@@ -925,7 +997,6 @@ class CustomInstallGUI(ttk.Frame):
             self.log('Copie NDS ignorée : dossier source non configuré dans les Paramètres.')
             return
 
-        cia_size = self._pack_size_var.get()
         nds_size = self.config.get('cia_to_nds', {}).get(cia_size)
         if not nds_size:
             self.log(f'Copie NDS ignorée : pas de mapping NDS pour {cia_size}.')
@@ -933,7 +1004,6 @@ class CustomInstallGUI(ttk.Frame):
 
         nds_packs = self.config.get('nds_packs', {})
         nds_pack_order = self.config.get('nds_pack_order', list(nds_packs.keys()))
-        language = self._nds_lang_var.get()
 
         # Logique additive : tous les packs jusqu'au pack cible inclus
         try:
@@ -973,7 +1043,7 @@ class CustomInstallGUI(ttk.Frame):
                 needed_gb = total_nds_size / (1024 ** 3)
                 free_gb = free / (1024 ** 3)
                 self.log(f'Copie NDS annulée : {needed_gb:.2f} Go requis, {free_gb:.2f} Go disponibles.')
-                self.after(0, lambda n=needed_gb, f=free_gb: self.show_error(
+                ui_call(lambda n=needed_gb, f=free_gb: self.show_error(
                     f'Espace insuffisant pour la copie NDS :\n'
                     f'Requis : {n:.2f} Go\nDisponible : {f:.2f} Go'))
                 return
@@ -982,21 +1052,22 @@ class CustomInstallGUI(ttk.Frame):
 
         # --- Copie ---
         self.log(f'Copie NDS ({language}) – {" + ".join(packs_to_copy)}...')
-        self.after(0, lambda: self.progressbar.config(maximum=100, value=0))
+        ui_call(lambda: self.progressbar.config(maximum=100, value=0))
         cancelled = [False]
 
         def on_progress(copied, total, speed, filename):
             # Appelé depuis le thread de copie → after() obligatoire
             pct = (copied / total * 100) if total > 0 else 0
+
             def _upd(p=pct, s=speed, f=filename):
                 self.progressbar.config(value=p)
                 self.status_label.config(
                     text=f'NDS {p:.1f}%  —  {s / (1024 ** 2):.1f} Mo/s  —  {f}')
-            self.after(0, _upd)
+            ui_call(_upd)
 
         def on_error(message):
             self.log(f'Erreur NDS : {message}')
-            self.after(0, lambda m=message: self.show_error(
+            ui_call(lambda m=message: self.show_error(
                 f'Erreur lors de la copie NDS :\n{m}'))
 
         for pack_name in packs_to_copy:
@@ -1088,10 +1159,20 @@ class CustomInstallGUI(ttk.Frame):
             # ignoring end
             self.log(message)
 
+        last_progress = [0.0]
+
         def ci_update_percentage(total_percent, total_read, size):
-            self.progressbar.config(value=total_percent + finished_percent)
-            if taskbar:
-                taskbar.SetProgressValue(self.hwnd, int(total_percent + finished_percent), max_percentage)
+            now = time.monotonic()
+            if now - last_progress[0] < 0.1 and total_percent < 100:
+                return  # max ~10 mises à jour/s
+            last_progress[0] = now
+            value = total_percent + finished_percent
+
+            def _ui(v=value):
+                self.progressbar.config(value=v)
+                if taskbar:
+                    taskbar.SetProgressValue(self.hwnd, int(v), max_percentage)
+            ui_call(_ui)
 
         def ci_on_error(exc):
             if taskbar:
@@ -1106,13 +1187,13 @@ class CustomInstallGUI(ttk.Frame):
             nonlocal finished_percent
             finished_percent = idx * 100
             if taskbar:
-                taskbar.SetProgressValue(self.hwnd, finished_percent, max_percentage)
+                ui_call(lambda v=finished_percent: taskbar.SetProgressValue(self.hwnd, v, max_percentage))
 
         installer.event.on_log_msg += ci_on_log_msg
         installer.event.update_percentage += ci_update_percentage
         installer.event.on_error += ci_on_error
         installer.event.on_cia_start += ci_on_cia_start
-        installer.event.update_status += self.update_status
+        installer.event.update_status += lambda path, status: ui_call(lambda: self.update_status(path, status))
 
         if self.skip_contents_var.get() != 1:
             total_size, free_space = installer.check_size()
@@ -1122,6 +1203,11 @@ class CustomInstallGUI(ttk.Frame):
                                 f'Free space: {free_space / (1024 * 1024):0.2f} MiB')
                 self.enable_buttons()
                 return
+
+        # Lues ici, sur le thread de l'interface, et non depuis le thread d'installation
+        copy_nds = bool(self._nds_enabled_var.get())
+        nds_cia_size = self._pack_size_var.get()
+        nds_language = self._nds_lang_var.get()
 
         def install():
             try:
@@ -1139,23 +1225,30 @@ class CustomInstallGUI(ttk.Frame):
                         self.show_error("An error occurred when trying to run save3ds_fuse.\n"
                                         "Either title.db doesn't exist, or save3ds_fuse couldn't be run.")
                         self.open_console()
-                self.after(0, _show_result)
-                if result and self._nds_enabled_var.get():
-                    self._run_nds_copy(sd_root)
+                ui_call(_show_result)
+                if result and copy_nds:
+                    self._run_nds_copy(sd_root, nds_cia_size, nds_language)
             except:
                 exc = sys.exc_info()
-                self.after(0, lambda e=exc: installer.event.on_error(e))
+                ui_call(lambda e=exc: installer.event.on_error(e))
             finally:
-                self.after(0, lambda: (setattr(self, '_installing_root', None), self.enable_buttons()))
+                def _end():
+                    self._installing_root = None
+                    self.enable_buttons()
+                    if taskbar:
+                        taskbar.SetProgressState(self.hwnd, tbl.TBPF_NOPROGRESS)
+                ui_call(_end)
 
         self._installing_root = sd_root
-        Thread(target=install).start()
+        # Pas daemon : fermer la fenêtre ne doit pas couper une installation en cours d'écriture sur la SD
+        Thread(target=install, name='installation-cia').start()
 
 
 class NDSCopyFrame(ttk.Frame):
     def __init__(self, parent, config):
         super().__init__(parent)
         self.config = config
+        _start_ui_pump(self)
         self._busy_root = None
         _BUSY_PROVIDERS.append(
             lambda: self._busy_root if str(self._start_btn.cget('state')) == tk.DISABLED else None)
@@ -1247,7 +1340,7 @@ class NDSCopyFrame(ttk.Frame):
             self._log_text.insert(tk.END, message + '\n')
             self._log_text.see(tk.END)
             self._log_text.configure(state=tk.DISABLED)
-        self.after(0, _do)
+        ui_call(_do)
 
     def _update_progress(self, copied, total, speed, filename):
         # Appelé depuis le thread NDSCopier → throttle à 10/sec pour ne pas saturer la queue
@@ -1258,7 +1351,7 @@ class NDSCopyFrame(ttk.Frame):
         pct = (copied / total * 100) if total > 0 else 0
         text = (f'{pct:.1f}%  —  {copied / (1024 ** 3):.2f} Go / {total / (1024 ** 3):.2f} Go'
                 f'  —  {speed / (1024 ** 2):.1f} Mo/s')
-        self.after(0, lambda p=pct, t=text, f=filename: (
+        ui_call(lambda p=pct, t=text, f=filename: (
             self._progress_var.set(p),
             self._progress_label.config(text=t),
             self._file_label.config(text=f),
@@ -1273,7 +1366,7 @@ class NDSCopyFrame(ttk.Frame):
             self._log_text.configure(state=tk.DISABLED)
             self._start_btn.config(state=tk.NORMAL)
             self._cancel_btn.config(state=tk.DISABLED)
-        self.after(0, _do)
+        ui_call(_do)
 
     def _on_pack_changed(self, event=None):
         pack_name = self._nds_pack_var.get()
@@ -1377,7 +1470,7 @@ class NDSCopyFrame(ttk.Frame):
                                      'Annulation de la copie NDS.', parent=self)
                         self._start_btn.config(state=tk.NORMAL)
                         self._cancel_btn.config(state=tk.DISABLED)
-                    self.after(0, _abort_nds)
+                    ui_call(_abort_nds)
                     return
             except OSError:
                 pass  # Si le disque n'est pas accessible, on tente quand même
@@ -1410,7 +1503,7 @@ class NDSCopyFrame(ttk.Frame):
                 self._log('Copie annulée.')
             else:
                 self._log(f'Copie NDS terminée → {target_path}')
-            self.after(0, lambda: (
+            ui_call(lambda: (
                 self._start_btn.config(state=tk.NORMAL),
                 self._cancel_btn.config(state=tk.DISABLED),
             ))
@@ -1429,6 +1522,7 @@ class CustomPackFrame(ttk.Frame):
     def __init__(self, parent, config):
         super().__init__(parent)
         self.config = config
+        _start_ui_pump(self)
         self._cancelled = [False]
         self._busy_root = None
         _BUSY_PROVIDERS.append(
@@ -1570,7 +1664,7 @@ class CustomPackFrame(ttk.Frame):
             self._log_text.insert(tk.END, message + '\n')
             self._log_text.see(tk.END)
             self._log_text.configure(state=tk.DISABLED)
-        self.after(0, _do)
+        ui_call(_do)
 
     def _copy_contents(self, src, target_path, cancelled, state):
         for dirpath, _, filenames in walk(src):
@@ -1600,7 +1694,7 @@ class CustomPackFrame(ttk.Frame):
                     label = (f'{pct:.1f}%  —  {state["copied"] / (1024 ** 3):.2f} Go'
                              f' / {state["total"] / (1024 ** 3):.2f} Go'
                              f'  —  {speed / (1024 ** 2):.1f} Mo/s')
-                    self.after(0, lambda p=pct, t=label, f=filename: (
+                    ui_call(lambda p=pct, t=label, f=filename: (
                         self._progress_var.set(p),
                         self._progress_label.config(text=t),
                         self._file_label.config(text=f),
@@ -1610,7 +1704,7 @@ class CustomPackFrame(ttk.Frame):
         try:
             self._run_copy_inner(sources, target_path, cancelled)
         except Exception as e:
-            self.after(0, lambda m=f'Copie interrompue : {type(e).__name__}: {e}': self._abort(m, error=True))
+            ui_call(lambda m=f'Copie interrompue : {type(e).__name__}: {e}': self._abort(m, error=True))
 
     def _run_copy_inner(self, sources, target_path, cancelled):
         total = 0
@@ -1641,7 +1735,7 @@ class CustomPackFrame(ttk.Frame):
                                  'Annulation de la copie.', parent=self)
                     self._start_btn.config(state=tk.NORMAL)
                     self._cancel_btn.config(state=tk.DISABLED)
-                self.after(0, _abort_cp)
+                ui_call(_abort_cp)
                 return
         except OSError:
             pass  # Si le disque n'est pas accessible, on tente quand même
@@ -1660,14 +1754,14 @@ class CustomPackFrame(ttk.Frame):
         m, s = divmod(int(elapsed), 60)
         if cancelled[0]:
             self._log('Copie annulée.')
-            self.after(0, lambda: self._progress_label.config(text='Annulé.'))
+            ui_call(lambda: self._progress_label.config(text='Annulé.'))
         else:
             avg_speed = state['copied'] / elapsed if elapsed > 0 else 0
             self._log(f'Terminé en {m}m{s:02d}s  —  Débit moyen : {avg_speed / (1024 ** 2):.1f} Mo/s')
             self._log(f'Destination : {target_path}')
-            self.after(0, lambda: self._progress_label.config(text='Terminé.'))
+            ui_call(lambda: self._progress_label.config(text='Terminé.'))
 
-        self.after(0, lambda: (
+        ui_call(lambda: (
             self._start_btn.config(state=tk.NORMAL),
             self._cancel_btn.config(state=tk.DISABLED),
         ))
@@ -1714,10 +1808,10 @@ class CustomPackFrame(ttk.Frame):
             try:
                 info = sdformat.get_safe_drive(target_path[0], sdformat.max_bytes_from_config(self.config))
             except sdformat.SDFormatError as e:
-                self.after(0, lambda m=str(e): self._abort(m, error=True))
+                ui_call(lambda m=str(e): self._abort(m, error=True))
                 return
             ok, fs, cluster = sdformat.check_sd_format(info.letter)
-            self.after(0, lambda: self._ask_prepare(info, ok, fs, cluster, sources, cancelled))
+            ui_call(lambda: self._ask_prepare(info, ok, fs, cluster, sources, cancelled))
 
         Thread(target=check, daemon=True).start()
 
@@ -1783,20 +1877,20 @@ class CustomPackFrame(ttk.Frame):
         def work():
             try:
                 if do_format:
-                    self.after(0, lambda: self._progress_label.config(text='Formatage en cours...'))
+                    ui_call(lambda: self._progress_label.config(text='Formatage en cours...'))
                     sdformat.format_drive_elevated(info.letter, label, info.size, max_bytes, log=self._log)
                 elif clear:
-                    self.after(0, lambda: self._progress_label.config(text='Suppression du contenu...'))
+                    ui_call(lambda: self._progress_label.config(text='Suppression du contenu...'))
                     self._log(f'Suppression du contenu de {drive}...')
                     n = sdformat.clear_drive_contents(info.root, max_bytes, log=self._log, cancelled=cancelled)
                     self._log(f'{n} élément(s) supprimé(s).')
             except (sdformat.SDFormatError, OSError) as e:
-                self.after(0, lambda m=str(e): self._abort(m, error=True))
+                ui_call(lambda m=str(e): self._abort(m, error=True))
                 return
             if cancelled[0]:
-                self.after(0, lambda: self._abort('Copie annulée.'))
+                ui_call(lambda: self._abort('Copie annulée.'))
                 return
-            self.after(0, lambda: self._progress_label.config(text='Calcul de la taille...'))
+            ui_call(lambda: self._progress_label.config(text='Calcul de la taille...'))
             self._run_copy(sources, info.root, cancelled)
 
         Thread(target=work, daemon=True).start()
@@ -1813,6 +1907,7 @@ class SDFormatFrame(ttk.Frame):
     def __init__(self, parent, config):
         super().__init__(parent)
         self.config = config
+        _start_ui_pump(self)
         self._drives = {}
         self._busy_root = None
         _BUSY_PROVIDERS.append(
@@ -1874,7 +1969,7 @@ class SDFormatFrame(ttk.Frame):
             self._log_text.insert(tk.END, message + '\n')
             self._log_text.see(tk.END)
             self._log_text.configure(state=tk.DISABLED)
-        self.after(0, _do)
+        ui_call(_do)
 
     def _update_note(self):
         limit = sdformat.format_limit(sdformat.max_bytes_from_config(self.config))
@@ -1900,10 +1995,7 @@ class SDFormatFrame(ttk.Frame):
                 idx = next((i for i, v in enumerate(values) if cur and _drive_to_path(v)[:1] == cur), 0)
                 self._drive_combo.current(idx)
                 self._update_status()
-            try:
-                self.after(0, apply)
-            except RuntimeError:
-                pass  # fenêtre fermée entre-temps
+            ui_call(apply)
         Thread(target=work, daemon=True).start()
 
     def _update_status(self):
@@ -1948,9 +2040,9 @@ class SDFormatFrame(ttk.Frame):
             try:
                 info = sdformat.get_safe_drive(letter, sdformat.max_bytes_from_config(self.config))
             except sdformat.SDFormatError as e:
-                self.after(0, lambda m=str(e): done(m, error=True))
+                ui_call(lambda m=str(e): done(m, error=True))
                 return
-            self.after(0, lambda: confirm(info))
+            ui_call(lambda: confirm(info))
 
         def confirm(info):
             cl = f' ({info.cluster // 1024} Ko)' if info.cluster else ''
@@ -1973,13 +2065,13 @@ class SDFormatFrame(ttk.Frame):
                                                    sdformat.max_bytes_from_config(self.config), log=self._log)
                 except sdformat.SDFormatError as e:
                     self._log(f'Erreur : {e}')
-                    self.after(0, lambda m=str(e): done(m, error=True))
+                    ui_call(lambda m=str(e): done(m, error=True))
                     return
                 except Exception as e:
                     self._log(f'Erreur : {e}')
-                    self.after(0, lambda m=f'{type(e).__name__} : {e}': done(m, error=True))
+                    ui_call(lambda m=f'{type(e).__name__} : {e}': done(m, error=True))
                     return
-                self.after(0, lambda: done(f'{info.letter}: est formatée en FAT32 (clusters de 32 Ko).'))
+                ui_call(lambda: done(f'{info.letter}: est formatée en FAT32 (clusters de 32 Ko).'))
             Thread(target=work, daemon=True).start()
 
         Thread(target=check, daemon=True).start()
@@ -2361,6 +2453,9 @@ def main():
         mb.showwarning('Avertissement',
                        "save3ds_fuse est introuvable.\n"
                        "L'installation de fichiers CIA ne sera pas disponible.")
+
+    _start_ui_pump(window)
+    _start_freeze_watchdog(window)
 
     notebook = ttk.Notebook(window)
     notebook.pack(fill=tk.BOTH, expand=True)
