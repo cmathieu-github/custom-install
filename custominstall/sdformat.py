@@ -32,6 +32,8 @@ DEFAULT_MAX_SIZE_GB = 1100               # 1,1 To, réglable dans Paramètres (m
 KEEP_ON_CLEAR = {'system volume information', '$recycle.bin'}
 
 ERROR_NOT_READY = 21                     # lecteur de cartes sans carte
+IOCTL_STORAGE_MEDIA_REMOVAL = 0x002D4804
+IOCTL_STORAGE_EJECT_MEDIA = 0x002D4808
 
 _APP_ROOT = dirname(dirname(abspath(__file__)))
 
@@ -167,12 +169,27 @@ def _partition_map():
     return {str(d.get('Letter', '')).upper(): d for d in data if d.get('Letter')}
 
 
-def evaluate_drive(letter, vol, max_bytes):
-    """Construit un DriveInfo : seuls C:, D: et les disques au-delà de la limite sont exclus."""
+def _dos_device(letter):
+    r"""Cible Windows d'une lettre : « \Device\HarddiskVolume3 », ou « \??\D:\dossier » pour un subst."""
+    import ctypes as ct
+    buf = ct.create_unicode_buffer(1024)
+    if not ct.windll.kernel32.QueryDosDeviceW(letter + ':', buf, 1024):
+        return ''
+    return buf.value
+
+
+def evaluate_drive(letter, vol, max_bytes, forbidden_devices=()):
+    """Construit un DriveInfo : seuls C:, D: (et leurs alias) et les disques au-delà de la limite sont exclus."""
     info = DriveInfo(letter=letter, label=vol.get('label', ''), fs=vol.get('fs', ''),
                      cluster=vol.get('cluster', 0), size=vol.get('size', 0))
+    device = vol.get('device', '')
     if letter in FORBIDDEN_LETTERS:
         info.reason = 'C: et D: ne sont jamais proposés'
+    elif device.startswith('\\??\\'):
+        # Lettre créée avec subst : l'accès direct viserait le vrai disque (souvent C: ou D:)
+        info.reason = f'lecteur virtuel vers {device[4:] or "un autre disque"}'
+    elif device and device in forbidden_devices:
+        info.reason = 'autre lettre de C: ou D:'
     elif not info.size:
         info.reason = 'taille inconnue'
     elif info.size > max_bytes:
@@ -190,6 +207,7 @@ def list_drives(max_bytes, include_unsafe=False):
     bitmask = ct.windll.kernel32.GetLogicalDrives()
     letters = [chr(65 + i) for i in range(26) if bitmask & (1 << i)]
     partitions = None
+    forbidden_devices = {_dos_device(l) for l in FORBIDDEN_LETTERS} - {''}
     drives = []
     for letter in letters:
         if letter in ('A', 'B'):
@@ -201,7 +219,8 @@ def list_drives(max_bytes, include_unsafe=False):
             if partitions is None:
                 partitions = _partition_map()
             vol['size'] = int((partitions.get(letter) or {}).get('PartitionSize') or 0)
-        info = evaluate_drive(letter, vol, max_bytes)
+        vol['device'] = _dos_device(letter)
+        info = evaluate_drive(letter, vol, max_bytes, forbidden_devices)
         if info.safe or include_unsafe:
             drives.append(info)
     return drives
@@ -267,6 +286,82 @@ def clear_drive_contents(root, max_bytes, log=print, cancelled=None):
         except OSError as e:
             log(f'  Impossible de supprimer {entry.name} : {e}')
     return count
+
+
+# --------------------------------------------------------------------------- #
+# Éjection
+
+def _media_present(letter):
+    import ctypes as ct
+    if not ct.windll.kernel32.GetLogicalDrives() & (1 << (ord(letter) - 65)):
+        return False
+    return _volume_info(letter) is not None
+
+
+def _eject_volume(letter):
+    """Verrouille, démonte et éjecte le média. None si réussi, sinon 'in_use', 'open' ou 'eject'."""
+    import ctypes as ct
+    import ctypes.wintypes as wt
+    k32 = ct.WinDLL('kernel32', use_last_error=True)
+    k32.CreateFileW.restype = wt.HANDLE
+    k32.CreateFileW.argtypes = [wt.LPCWSTR, wt.DWORD, wt.DWORD, ct.c_void_p, wt.DWORD, wt.DWORD, wt.HANDLE]
+    k32.DeviceIoControl.argtypes = [wt.HANDLE, wt.DWORD, ct.c_void_p, wt.DWORD, ct.c_void_p, wt.DWORD,
+                                    ct.POINTER(wt.DWORD), ct.c_void_p]
+    k32.FlushFileBuffers.argtypes = [wt.HANDLE]
+    k32.CloseHandle.argtypes = [wt.HANDLE]
+    invalid = (None, ct.c_void_p(-1).value)
+
+    path = '\\\\.\\' + letter + ':'
+    handle = k32.CreateFileW(path, 0xC0000000, 0x3, None, 3, 0, None)
+    if handle in invalid:
+        handle = k32.CreateFileW(path, 0x80000000, 0x3, None, 3, 0, None)
+    if handle in invalid:
+        return 'open'
+
+    def ioctl(code, inbuf=None, insize=0):
+        returned = wt.DWORD(0)
+        return bool(k32.DeviceIoControl(handle, code, inbuf, insize, None, 0, ct.byref(returned), None))
+
+    try:
+        k32.FlushFileBuffers(handle)  # écrit ce qui reste en cache avant de retirer la carte
+        for attempt in range(10):
+            if ioctl(VolumeTarget.FSCTL_LOCK_VOLUME):
+                break
+            time.sleep(0.3)
+        else:
+            return 'in_use'  # un fichier ou un dossier de la carte est ouvert
+        ioctl(VolumeTarget.FSCTL_DISMOUNT_VOLUME)
+        allow = ct.create_string_buffer(b'\x00', 1)  # PREVENT_MEDIA_REMOVAL = FALSE
+        ioctl(IOCTL_STORAGE_MEDIA_REMOVAL, allow, 1)
+        if not ioctl(IOCTL_STORAGE_EJECT_MEDIA):
+            return 'eject'
+        return None
+    finally:
+        k32.CloseHandle(handle)  # libère aussi le verrou
+
+
+def eject_drive(letter, max_bytes, log=print):
+    """Éjecte la carte SD (comme « Éjecter » dans l'Explorateur). Lève SDFormatError en cas d'échec."""
+    if not is_windows:
+        raise SDFormatError('L’éjection n’est disponible que sous Windows.')
+    info = get_safe_drive(letter, max_bytes)
+    letter = info.letter
+    log(f'Éjection de {letter}:...')
+    error = _eject_volume(letter)
+    if error == 'in_use':
+        raise SDFormatError(f'Impossible d’éjecter {letter}: : un fichier ou un dossier de la carte est ouvert '
+                            '(fenêtre de l’Explorateur, autre programme). Fermez-le puis réessayez.')
+    if error:
+        # Lecteur qui refuse l'éjection directe : on passe par la commande « Éjecter » de l'Explorateur
+        _powershell("(New-Object -ComObject Shell.Application).Namespace(17)"
+                    f".ParseName('{letter}:\\').InvokeVerb('Eject')")
+    for _ in range(40):
+        if not _media_present(letter):
+            log(f'{letter}: éjectée, la carte peut être retirée.')
+            return True
+        time.sleep(0.25)
+    raise SDFormatError(f'Windows n’a pas pu éjecter {letter}:. '
+                        'Utilisez « Retirer le périphérique en toute sécurité » dans la barre des tâches.')
 
 
 # --------------------------------------------------------------------------- #

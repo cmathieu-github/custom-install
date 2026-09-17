@@ -100,7 +100,8 @@ statuses = {
 
 
 _DRIVE_NONE = '(Aucun)'
-DRIVE_LIMIT_EVENT = '<<DriveLimitChanged>>'  # émis quand la limite de taille est modifiée
+DRIVES_CHANGED_EVENT = '<<DrivesChanged>>'  # recharge les listes de lecteurs de tous les onglets
+_BUSY_PROVIDERS = []  # fonctions renvoyant la racine du lecteur utilisé par une opération en cours
 
 
 def _drive_to_path(value):
@@ -146,12 +147,63 @@ def _refresh_sd_combo_async(widget, combo, config, on_done=None):
     Thread(target=work, daemon=True).start()
 
 
+def _busy_letters():
+    letters = set()
+    for provider in _BUSY_PROVIDERS:
+        try:
+            root = provider()
+        except Exception:
+            root = None
+        if root and len(root) >= 2 and root[1] == ':':
+            letters.add(root[0].upper())
+    return letters
+
+
+def _eject_from_combo(widget, combo, config, on_ejected=None):
+    """Éjecte le lecteur sélectionné dans le combo (bouton « Éjecter » des onglets)."""
+    root = _drive_to_path(combo.get())
+    if not root or not is_windows:
+        mb.showerror('Éjecter', 'Veuillez sélectionner un lecteur.', parent=widget)
+        return
+    letter = root[0].upper()
+    if letter in _busy_letters():
+        mb.showerror('Éjecter', f'Une copie, une installation ou un formatage est en cours sur {letter}:.\n'
+                                'Attendez la fin ou annulez avant d’éjecter.', parent=widget)
+        return
+    top = widget.winfo_toplevel()
+    top.config(cursor='watch')
+
+    def work():
+        try:
+            sdformat.eject_drive(letter, sdformat.max_bytes_from_config(config), log=lambda m: None)
+            error = None
+        except sdformat.SDFormatError as e:
+            error = str(e)
+        except Exception as e:
+            error = f'{type(e).__name__} : {e}'
+
+        def done():
+            top.config(cursor='')
+            if error:
+                mb.showerror('Éjecter', error, parent=widget)
+            else:
+                if on_ejected:
+                    on_ejected(letter)
+                mb.showinfo('Éjecter', f'La carte {letter}: peut être retirée en toute sécurité.', parent=widget)
+            top.event_generate(DRIVES_CHANGED_EVENT)
+        try:
+            widget.after(0, done)
+        except RuntimeError:
+            pass
+    Thread(target=work, daemon=True).start()
+
+
 def _setup_drive_combo(widget, combo, config, on_done=None):
     """Remplit le combo au démarrage et à chaque changement de la limite de taille."""
     refresh = lambda *_: _refresh_sd_combo_async(widget, combo, config, on_done)
     # Différé : le thread ne doit rappeler l'interface qu'une fois la boucle Tk démarrée
     widget.after(200, refresh)
-    widget.winfo_toplevel().bind(DRIVE_LIMIT_EVENT, refresh, add='+')
+    widget.winfo_toplevel().bind(DRIVES_CHANGED_EVENT, refresh, add='+')
     return refresh
 
 
@@ -348,6 +400,8 @@ class CustomInstallGUI(ttk.Frame):
         self.config = config or {}
 
         self.readers = {}
+        self._installing_root = None
+        _BUSY_PROVIDERS.append(lambda: self._installing_root)
         self.lock = Lock()
         self.log_messages = []
         self.hwnd = None
@@ -399,17 +453,25 @@ class CustomInstallGUI(ttk.Frame):
 
         sd_inner = ttk.Frame(dest_frame)
         sd_inner.grid(row=0, column=1, sticky=tk.EW, padx=5, pady=(8, 3))
-        sd_inner.columnconfigure(2, weight=1)
+        sd_inner.columnconfigure(3, weight=1)
 
         self._sd_drive_combo = ttk.Combobox(sd_inner, values=[_DRIVE_NONE], state='readonly', width=30)
         self._sd_drive_combo.current(0)  # (Aucun) par défaut
         self._sd_drive_combo.grid(row=0, column=0, padx=(0, 3))
         refresh_sd_drives = _setup_drive_combo(self, self._sd_drive_combo, self.config)
 
-        ttk.Button(sd_inner, text='↻', width=3, command=refresh_sd_drives).grid(row=0, column=1, padx=(0, 6))
+        ttk.Button(sd_inner, text='↻', width=3, command=refresh_sd_drives).grid(row=0, column=1, padx=(0, 3))
+
+        def sd_ejected(letter):
+            if sd_selected.get('1.0', tk.END).strip()[:2].upper() == f'{letter}:':
+                sd_selected.delete('1.0', tk.END)
+
+        ttk.Button(sd_inner, text='⏏ Éjecter',
+                   command=lambda: _eject_from_combo(self, self._sd_drive_combo, self.config, sd_ejected)).grid(
+            row=0, column=2, padx=(0, 6))
 
         sd_selected = tk.Text(sd_inner, wrap='none', height=1)
-        sd_selected.grid(row=0, column=2, sticky=tk.EW)
+        sd_selected.grid(row=0, column=3, sticky=tk.EW)
 
         def on_sd_drive_selected(event):
             path = _drive_to_path(self._sd_drive_combo.get())
@@ -1084,8 +1146,9 @@ class CustomInstallGUI(ttk.Frame):
                 exc = sys.exc_info()
                 self.after(0, lambda e=exc: installer.event.on_error(e))
             finally:
-                self.after(0, self.enable_buttons)
+                self.after(0, lambda: (setattr(self, '_installing_root', None), self.enable_buttons()))
 
+        self._installing_root = sd_root
         Thread(target=install).start()
 
 
@@ -1093,6 +1156,9 @@ class NDSCopyFrame(ttk.Frame):
     def __init__(self, parent, config):
         super().__init__(parent)
         self.config = config
+        self._busy_root = None
+        _BUSY_PROVIDERS.append(
+            lambda: self._busy_root if str(self._start_btn.cget('state')) == tk.DISABLED else None)
         self._cancelled = [False]
 
         self.rowconfigure(2, weight=1)
@@ -1113,7 +1179,9 @@ class NDSCopyFrame(ttk.Frame):
         self._drive_combo.grid(row=0, column=0, padx=(0, 3))
         _refresh_nds = _setup_drive_combo(self, self._drive_combo, config)
 
-        ttk.Button(_dc, text='↻', width=3, command=_refresh_nds).grid(row=0, column=1)
+        ttk.Button(_dc, text='↻', width=3, command=_refresh_nds).grid(row=0, column=1, padx=(0, 3))
+        ttk.Button(_dc, text='⏏ Éjecter',
+                   command=lambda: _eject_from_combo(self, self._drive_combo, config)).grid(row=0, column=2)
 
         # --- Options ---
         opts_frame = ttk.LabelFrame(self, text='Options')
@@ -1250,6 +1318,7 @@ class NDSCopyFrame(ttk.Frame):
         self._progress_var.set(0)
         self._progress_label.config(text='Démarrage...')
         self._file_label.config(text='')
+        self._busy_root = target_path
         self._start_btn.config(state=tk.DISABLED)
         self._cancel_btn.config(state=tk.NORMAL)
 
@@ -1361,6 +1430,9 @@ class CustomPackFrame(ttk.Frame):
         super().__init__(parent)
         self.config = config
         self._cancelled = [False]
+        self._busy_root = None
+        _BUSY_PROVIDERS.append(
+            lambda: self._busy_root if str(self._start_btn.cget('state')) == tk.DISABLED else None)
 
         self.rowconfigure(2, weight=1)
         self.columnconfigure(0, weight=1)
@@ -1378,7 +1450,9 @@ class CustomPackFrame(ttk.Frame):
         self._drive_combo.current(0)  # (Aucun) par défaut
         self._drive_combo.grid(row=0, column=0, padx=(0, 3))
         ttk.Button(_dc2, text='↻', width=3,
-                   command=_setup_drive_combo(self, self._drive_combo, config)).grid(row=0, column=1)
+                   command=_setup_drive_combo(self, self._drive_combo, config)).grid(row=0, column=1, padx=(0, 3))
+        ttk.Button(_dc2, text='⏏ Éjecter',
+                   command=lambda: _eject_from_combo(self, self._drive_combo, config)).grid(row=0, column=2)
 
         # --- Packs ---
         packs_frame = ttk.LabelFrame(self, text='Packs à copier (le contenu sera copié à la racine de la SD)')
@@ -1626,6 +1700,7 @@ class CustomPackFrame(ttk.Frame):
         self._progress_var.set(0)
         self._progress_label.config(text='Vérification de la carte SD...')
         self._file_label.config(text='')
+        self._busy_root = target_path
         self._start_btn.config(state=tk.DISABLED)
         self._cancel_btn.config(state=tk.NORMAL)
 
@@ -1739,6 +1814,9 @@ class SDFormatFrame(ttk.Frame):
         super().__init__(parent)
         self.config = config
         self._drives = {}
+        self._busy_root = None
+        _BUSY_PROVIDERS.append(
+            lambda: self._busy_root if str(self._start_btn.cget('state')) == tk.DISABLED else None)
         self.columnconfigure(0, weight=1)
         self.rowconfigure(2, weight=1)
 
@@ -1753,7 +1831,9 @@ class SDFormatFrame(ttk.Frame):
         self._drive_combo.current(0)
         self._drive_combo.grid(row=0, column=0, padx=(0, 3))
         self._drive_combo.bind('<<ComboboxSelected>>', lambda e: self._update_status())
-        ttk.Button(dc, text='↻', width=3, command=self._refresh).grid(row=0, column=1)
+        ttk.Button(dc, text='↻', width=3, command=self._refresh).grid(row=0, column=1, padx=(0, 3))
+        ttk.Button(dc, text='⏏ Éjecter',
+                   command=lambda: _eject_from_combo(self, self._drive_combo, config)).grid(row=0, column=2)
 
         ttk.Label(dest, text='Nom du volume :').grid(row=1, column=0, sticky=tk.W, padx=(8, 4), pady=5)
         self._label_var = tk.StringVar(value='3DS')
@@ -1783,7 +1863,7 @@ class SDFormatFrame(ttk.Frame):
 
         if is_windows:
             self.after(200, self._refresh)
-            self.winfo_toplevel().bind(DRIVE_LIMIT_EVENT, lambda e: (self._update_note(), self._refresh()), add='+')
+            self.winfo_toplevel().bind(DRIVES_CHANGED_EVENT, lambda e: (self._update_note(), self._refresh()), add='+')
         else:
             self._status.config(text='Formatage disponible uniquement sous Windows.')
             self._start_btn.config(state=tk.DISABLED)
@@ -1852,6 +1932,7 @@ class SDFormatFrame(ttk.Frame):
             return
         label = sdformat.sanitize_label(self._label_var.get()) or '3DS'
         self._label_var.set(label)
+        self._busy_root = letter + ':'
         self._start_btn.config(state=tk.DISABLED)
         self._progress.start(15)
 
@@ -2267,7 +2348,7 @@ class SettingsFrame(ttk.Frame):
         self.after(3000, lambda: self._status.config(text=''))
         if limit_changed:
             # Recharge la liste des lecteurs dans tous les onglets
-            self.winfo_toplevel().event_generate(DRIVE_LIMIT_EVENT)
+            self.winfo_toplevel().event_generate(DRIVES_CHANGED_EVENT)
 
 
 def main():
